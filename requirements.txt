@@ -1,0 +1,24 @@
+# Streamlit Cloud 배포용 — app.py에서 사용하는 외부 라이브러리
+# 표준라이브러리(random, re, threading, time, concurrent.futures, datetime, io, pathlib) 제외
+
+streamlit>=1.33.0
+pandas>=1.5.0
+plotly>=5.0.0
+
+# pip 패키지명: finance-datareader / import: FinanceDataReader
+finance-datareader>=0.9.50
+
+# pip 패키지명: pykrx / import: pykrx.stock
+pykrx>=1.0.0
+
+requests>=2.28.0
+urllib3>=1.26.0
+
+# pip 패키지명: beautifulsoup4 / import: bs4
+beautifulsoup4>=4.11.0
+
+# pandas.read_html(네이버·FnGuide 재무 테이블 파싱) 백엔드
+lxml>=4.9.0
+
+# pip 패키지명: curl-cffi / import: curl_cffi (선택 의존, 없으면 requests로 폴백)
+curl-cffi>=0.5.0
