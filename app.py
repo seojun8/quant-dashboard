@@ -15,9 +15,7 @@ _curl_cffi_disabled = False  # invalid library 등으로 실패 시 requests로 
 
 import random
 import re
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -25,7 +23,6 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # pykrx: 수급/시총 | FinanceDataReader: 장기 가격 | 네이버: 재무제표
 try:
@@ -118,7 +115,8 @@ def _fetch_supply_filter(_end_date: str) -> pd.DataFrame:
                 rows.append({"ticker": t, "name": name, "ratio": ratio, "net_buy": net_buy, "cap": cap})
             except Exception:
                 continue
-            time.sleep(0.03)
+            time.sleep(0.5)
+        time.sleep(0.5)
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -130,7 +128,7 @@ def _fetch_supply_filter(_end_date: str) -> pd.DataFrame:
 # ============== 2단계: 가격(낙폭과대) 필터링 ==============
 @st.cache_data(ttl=3600)
 def _check_single_price(ticker: str, start_fdr: str, end_fdr: str) -> dict | None:
-    """단일 종목 가격 필터 (병렬용)"""
+    """단일 종목 가격 필터 (순차 처리에서 호출)"""
     try:
         df = fdr.DataReader(ticker, start_fdr, end_fdr)
     except Exception:
@@ -154,34 +152,23 @@ def _check_single_price(ticker: str, start_fdr: str, end_fdr: str) -> dict | Non
     return None
 
 
-def _init_thread_ctx(ctx):
-    """서브 스레드에 메인 Streamlit ScriptRunContext 전달 (missing ScriptRunContext 경고 방지)."""
-    if ctx is not None:
-        add_script_run_ctx(threading.current_thread(), ctx)
-
-
-def _fetch_price_filter(tickers: list, _end_date: str, progress_callback=None, script_ctx=None) -> pd.DataFrame:
+def _fetch_price_filter(tickers: list, _end_date: str, progress_callback=None) -> pd.DataFrame:
     """
     5년 주봉 기준, 현재가 <= 최저가 + (최고가-최저가)/3 인 종목만 (하위 33% 구간)
-    병렬 처리로 속도 향상 (3 workers)
+    Streamlit Cloud 등 저사양 환경을 위해 순차 처리 + 요청 간 딜레이.
     """
     start_dt = datetime.strptime(_end_date, "%Y%m%d") - timedelta(days=365 * 5)
     start_fdr = _to_ymd(start_dt.strftime("%Y%m%d"))
     end_fdr = _to_ymd(_end_date)
     result = []
     total = len(tickers)
-    done = 0
-    ctx = script_ctx if script_ctx is not None else get_script_run_ctx()
-
-    with ThreadPoolExecutor(max_workers=3, initializer=_init_thread_ctx, initargs=(ctx,)) as ex:
-        futures = {ex.submit(_check_single_price, t, start_fdr, end_fdr): t for t in tickers}
-        for fut in as_completed(futures):
-            done += 1
-            if progress_callback:
-                progress_callback(2, done, total, f"2단계 가격 필터: {done}/{total} 종목 처리 중...")
-            row = fut.result()
-            if row:
-                result.append(row)
+    for i, t in enumerate(tickers):
+        if progress_callback:
+            progress_callback(2, i + 1, total, f"2단계 가격 필터: {i + 1}/{total} 종목 처리 중...")
+        row = _check_single_price(t, start_fdr, end_fdr)
+        if row:
+            result.append(row)
+        time.sleep(0.5)
 
     return pd.DataFrame(result)
 
@@ -251,10 +238,11 @@ def _fetch_finance_html(url: str, headers: dict) -> requests.Response | None:
             else:
                 r = _requests_session.get(url, headers=headers, timeout=15, verify=False)
             r.raise_for_status()
+            time.sleep(0.5)
             return r
         except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, ConnectionError, OSError) as e:
             if attempt < 2:
-                time.sleep(2**attempt)
+                time.sleep(max(0.5, float(2**attempt)))
             else:
                 raise e
     return None
@@ -534,10 +522,12 @@ def _fetch_pbr_batch(tickers: list, end_date: str) -> dict[str, float | None]:
                             out[t] = None
                     else:
                         out[t] = None
+                time.sleep(0.5)
                 return out  # 성공 시 즉시 반환
         except Exception:
             pass
         dt -= timedelta(days=1)
+        time.sleep(0.5)
     return out
 
 
@@ -623,34 +613,31 @@ def _filter_supply_volume(
                 passed.append(t)
         except Exception:
             info[t] = {"외국인 매수(O/X)": "X", "거래량 급증(O/X)": "X"}
-        time.sleep(0.02)
+        time.sleep(0.5)
     return passed, info
 
 
-def _filter_finance(tickers: list, names: dict, end_date: str, progress_callback=None, script_ctx=None) -> tuple[list, dict, list]:
+def _filter_finance(tickers: list, names: dict, end_date: str, progress_callback=None) -> tuple[list, dict, list]:
     """
     3·4단계: 강력한 성장 가치주 — 조건A(3년 무적자) + 조건B(매출·영업 CAGR 둘 다 10% 이상)
     Returns: (passed_tickers, {ticker: {영업이익, PBR, fin_df, cagr_dict}}, error_log)
+    순차 처리(재무 크롤링 종목당 요청 간 딜레이).
     """
     passed = []
     fin_info = {}
     error_log = []
     total = len(tickers)
-    done = 0
-    ctx = script_ctx if script_ctx is not None else get_script_run_ctx()
-    with ThreadPoolExecutor(max_workers=5, initializer=_init_thread_ctx, initargs=(ctx,)) as ex:
-        futures = {ex.submit(_process_single_finance, t, names): t for t in tickers}
-        for fut in as_completed(futures):
-            done += 1
-            if progress_callback and total > 0:
-                progress_callback(3, done, total, f"3·4단계 재무 필터: {done}/{total} 종목 처리 중...")
-            t, is_passed, fin_df, cagr_dict, err = fut.result()
-            if err is not None:
-                error_log.append(err)
-            op_val = fin_df["영업이익"].iloc[-1] if fin_df is not None and not fin_df.empty and "영업이익" in fin_df.columns else None
-            fin_info[t] = {"영업이익": op_val, "PBR": None, "fin_df": fin_df, "cagr_dict": cagr_dict or {}}
-            if is_passed and cagr_dict is not None:
-                passed.append(t)
+    for i, t in enumerate(tickers):
+        if progress_callback and total > 0:
+            progress_callback(3, i + 1, total, f"3·4단계 재무 필터: {i + 1}/{total} 종목 처리 중...")
+        t0, is_passed, fin_df, cagr_dict, err = _process_single_finance(t, names)
+        if err is not None:
+            error_log.append(err)
+        op_val = fin_df["영업이익"].iloc[-1] if fin_df is not None and not fin_df.empty and "영업이익" in fin_df.columns else None
+        fin_info[t0] = {"영업이익": op_val, "PBR": None, "fin_df": fin_df, "cagr_dict": cagr_dict or {}}
+        if is_passed and cagr_dict is not None:
+            passed.append(t0)
+        time.sleep(0.5)
     pbr_map = _fetch_pbr_batch(passed, end_date)
     for t in passed:
         if t in pbr_map:
@@ -664,6 +651,7 @@ def _build_price_chart(ticker: str, name: str, end_date: str, current_price: flo
     start_fdr = _to_ymd(start_dt.strftime("%Y%m%d"))
     end_fdr = _to_ymd(end_date)
     df = fdr.DataReader(ticker, start_fdr, end_fdr)
+    time.sleep(0.5)
     if df is None or len(df) < 10 or "Close" not in df.columns:
         fig = go.Figure()
         fig.add_annotation(text="데이터 없음", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
@@ -707,7 +695,7 @@ def _build_fin_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============== 메인 분석 파이프라인 ==============
-def run_full_analysis(end_date: str, progress_callback=None, script_ctx=None) -> tuple[pd.DataFrame, dict, dict, dict, dict]:
+def run_full_analysis(end_date: str, progress_callback=None) -> tuple[pd.DataFrame, dict, dict, dict, dict]:
     """
     progress_callback(stage, current, total, msg) — stage 1~4, 각 25% 구간
     Returns: (result_df, price_info_dict, fin_cache_dict, cagr_cache_dict, stage_counts)
@@ -733,7 +721,7 @@ def run_full_analysis(end_date: str, progress_callback=None, script_ctx=None) ->
         cb(1, 1, 1, f"1단계 완료: {len(tickers1)}종목 선정")
 
     # 2단계: 가격
-    price_df = _fetch_price_filter(tickers1, end_date, progress_callback=cb, script_ctx=script_ctx)
+    price_df = _fetch_price_filter(tickers1, end_date, progress_callback=cb)
     tickers2 = price_df["ticker"].tolist()
     price_info = price_df.set_index("ticker").to_dict("index")
     stage_counts["2단계_가격"] = len(tickers2)
@@ -744,7 +732,7 @@ def run_full_analysis(end_date: str, progress_callback=None, script_ctx=None) ->
         return pd.DataFrame(), {}, {}, stage_counts, pd.DataFrame(), []
 
     # 3·4단계: 재무 (조건A 무적자 + 조건B 매출·영업 CAGR 10% 이상)
-    passed, fin_info, finance_error_log = _filter_finance(tickers2, names, end_date, progress_callback=cb, script_ctx=script_ctx)
+    passed, fin_info, finance_error_log = _filter_finance(tickers2, names, end_date, progress_callback=cb)
     stage_counts["3·4단계_재무"] = len(passed)
     data_na = sum(1 for e in finance_error_log if e.get("에러유형") == "데이터없음")
     if cb:
@@ -832,6 +820,7 @@ def _fallback_tickers(
     for attempt in range(3):
         try:
             krx = fdr.StockListing("KRX")
+            time.sleep(0.5)
             break
         except Exception as e:
             if attempt == 2:
@@ -980,15 +969,14 @@ def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
     out = raw_df[cols].copy()
     out["매수단가"] = pd.to_numeric(out["매수단가"], errors="coerce").fillna(0)
     out["매수수량"] = pd.to_numeric(out["매수수량"], errors="coerce").fillna(0).astype(int)
-    # 고유 종목만 조회 후 병렬 fetch (속도 개선)
+    # 고유 종목만 순차 조회 (클라우드/저메모리 환경 부하 완화)
     end_date = _get_end_date()
     unique_codes = out["종목코드"].astype(str).str.zfill(6).unique().tolist()
     price_map = {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = {ex.submit(_fetch_current_price, c, _end_date=end_date): c for c in unique_codes}
-        for fut in as_completed(futures):
-            code = futures[fut]
-            price_map[code] = fut.result() if fut.result() is not None else 0
+    for c in unique_codes:
+        p = _fetch_current_price(c, _end_date=end_date)
+        price_map[c] = p if p is not None else 0
+        time.sleep(0.5)
     out["현재가"] = out["종목코드"].astype(str).str.zfill(6).map(lambda c: price_map.get(c, 0))
     out["평가금액"] = out["현재가"] * out["매수수량"]
     out["수익금"] = (out["현재가"] - out["매수단가"]) * out["매수수량"]
@@ -1312,7 +1300,7 @@ with tab1:
         try:
             st.caption("분석이 완료될 때까지 잠시만 기다려 주세요. (300종목 기준 약 3~5분 소요)")
             with st.spinner(""):
-                res = run_full_analysis(_get_end_date(), progress_callback=_on_progress, script_ctx=get_script_run_ctx())
+                res = run_full_analysis(_get_end_date(), progress_callback=_on_progress)
             _apply_analysis_result(res, None)
         except Exception as e:
             _apply_analysis_result(None, str(e))
