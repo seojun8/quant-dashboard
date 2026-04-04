@@ -1149,6 +1149,98 @@ def _fallback_tickers_pykrx(
     return None
 
 
+def _fallback_tickers_naver(
+    min_mcap_billion: float,
+    max_mcap_trillion: float,
+    max_stocks: int,
+) -> pd.DataFrame | None:
+    """
+    네이버 금융 시가총액 순위 HTML (KRX 웹/pykrx가 Cloud에서 막힐 때).
+    시가총액 숫자는 **억 원** 단위 → 내부 계산은 원으로 통일(×1e8).
+    """
+    max_pages = 45
+    if max_stocks and max_stocks > 0:
+        max_pages = min(50, max(10, (max_stocks * 2) // 45 + 8))
+    all_rows: list[dict] = []
+    for sosok, mlab in ((0, "KOSPI"), (1, "KOSDAQ")):
+        for page in range(1, max_pages + 1):
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+            try:
+                r = _requests_session.get(url, timeout=22, verify=False)
+                r.raise_for_status()
+            except Exception:
+                break
+            soup = BeautifulSoup(r.text, "lxml")
+            table = soup.select_one("table.type_2")
+            if not table:
+                break
+            tbody = table.find("tbody")
+            if not tbody:
+                break
+            n_added = 0
+            for tr in tbody.find_all("tr"):
+                if tr.find("th"):
+                    continue
+                tds = tr.find_all("td")
+                if len(tds) < 8:
+                    continue
+                a = tr.select_one("a.tltle") or tr.select_one("a[href*='main.naver?code=']")
+                if not a:
+                    continue
+                m = re.search(r"code=(\d{6})", a.get("href", ""))
+                if not m:
+                    continue
+                t6 = m.group(1)
+                name = a.get_text(strip=True)
+                link_i = next((i for i, td in enumerate(tds) if td.select_one("a[href*='code=']")), None)
+                if link_i is None:
+                    continue
+                cap_i = link_i + 6
+                if cap_i >= len(tds):
+                    continue
+                raw_cap = (
+                    tds[cap_i]
+                    .get_text(strip=True)
+                    .replace(",", "")
+                    .replace("\xa0", "")
+                    .replace(" ", "")
+                )
+                if not raw_cap or raw_cap in ("N/A", "—", "-") or raw_cap.upper() == "N/A":
+                    continue
+                try:
+                    cap_uk = float(raw_cap)
+                except ValueError:
+                    continue
+                if cap_uk <= 0:
+                    continue
+                marcap = cap_uk * 1e8
+                all_rows.append({"Code": t6, "Name": name, "Marcap": marcap, "Market": mlab})
+                n_added += 1
+            if n_added == 0:
+                break
+            time.sleep(0.22)
+    if not all_rows:
+        return None
+    krx = pd.DataFrame(all_rows)
+    krx = krx.sort_values("Marcap", ascending=False).drop_duplicates(subset=["Code"], keep="first")
+    krx = krx[~krx["Name"].fillna("").apply(_is_special_sector)]
+    if min_mcap_billion < 0:
+        filtered = krx.copy()
+    else:
+        min_val = min_mcap_billion * 1e8
+        max_val = max_mcap_trillion * 1e12
+        mask = (krx["Marcap"] >= min_val) & (krx["Marcap"] <= max_val)
+        filtered = krx[mask]
+    if max_stocks and max_stocks > 0:
+        filtered = filtered.nlargest(max_stocks, "Marcap")
+    if filtered.empty:
+        return None
+    return pd.DataFrame({
+        "ticker": filtered["Code"].astype(str).str.zfill(6),
+        "name": filtered["Name"].fillna(""),
+    })
+
+
 def _fallback_tickers(
     _end_date: str,
     min_mcap_billion: float = 500,
@@ -1162,6 +1254,10 @@ def _fallback_tickers(
     """
     # pykrx 우선 — Streamlit Cloud 등에서 FinanceDataReader(KRX 웹)가 자주 실패함
     alt = _fallback_tickers_pykrx(_end_date, min_mcap_billion, max_mcap_trillion, max_stocks)
+    if alt is not None and not alt.empty:
+        return alt
+
+    alt = _fallback_tickers_naver(min_mcap_billion, max_mcap_trillion, max_stocks)
     if alt is not None and not alt.empty:
         return alt
 
@@ -1179,9 +1275,9 @@ def _fallback_tickers(
     if krx is None:
         raise RuntimeError(
             "증권(코스피·코스닥) **종목·시총** 목록을 가져오지 못했습니다.\n\n"
-            "• **Streamlit Cloud**: `FinanceDataReader`가 KRX 웹(`data.krx.co.kr`)에 붙지 못하는 경우가 많습니다. "
-            "이 배포는 **pykrx**로 먼저 조회합니다 — **requirements.txt에 pykrx**가 있고, **GitHub에 푸시 후 Cloud가 재배포**됐는지 확인하세요.\n"
-            "• 에러 글에 **「홈페이지 접속 실패」만** 있고 위 설명이 없으면 **옛 빌드**를 보고 있는 것입니다.\n"
+            "• 시도 순서: **pykrx** → **네이버 금융 시가총액 순위** → **FinanceDataReader**.\n"
+            "• Streamlit Cloud는 `data.krx.co.kr` 차단이 흔합니다. **세 경로 모두 실패**하면 해당 서버에서 "
+            "네이버·KRX 연결이 막힌 경우일 수 있어, 잠시 후 재시도하거나 로컬에서 실행해 보세요.\n"
             f"• (FDR 마지막 오류) {last_err}"
         ) from last_err
     krx = krx[krx["Market"].isin(["KOSPI", "KOSDAQ"])]
