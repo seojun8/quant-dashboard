@@ -17,6 +17,7 @@ import json
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
 import gspread
@@ -95,6 +96,17 @@ def _parse_spreadsheet_id_from_url(url_or_id: str) -> str | None:
     return None
 
 
+def _parse_gid_from_spreadsheet_url(url: str) -> int | None:
+    """공유 URL의 gid= (탭별 시트 ID). 브라우저에서 연 탭과 동일한 시트를 연다."""
+    s = (url or "").strip()
+    if not s:
+        return None
+    m = re.search(r"gid=(\d+)", s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def _parse_service_account_json(raw) -> dict | None:
     """GOOGLE_CREDENTIALS: 삼중따옴표/백틱/Code fence 제거 후 JSON 파싱."""
     if raw is None:
@@ -154,10 +166,11 @@ def _toml_like_to_dict(obj) -> dict:
     return r if isinstance(r, dict) else {}
 
 
-def _mock_gsheets_settings() -> tuple[str, str, dict] | None:
+def _mock_gsheets_settings() -> tuple[str, str, dict, int | None] | None:
     """
     우선순위: (1) SPREADSHEET_URL + GOOGLE_CREDENTIALS (2) [mock_portfolio_gsheets] 테이블.
-    반환: (spreadsheet_id, worksheet_name, service_account_dict)
+    반환: (spreadsheet_id, worksheet_name, service_account_dict, worksheet_gid_or_none)
+    worksheet_gid: URL의 gid= 값이 있으면 해당 탭을 우선 연다(예전 데이터가 첫 탭일 때 필수).
     """
     sec = _streamlit_secrets_or_none()
     if sec is None:
@@ -170,8 +183,9 @@ def _mock_gsheets_settings() -> tuple[str, str, dict] | None:
             sid = _parse_spreadsheet_id_from_url(url)
             sa = _parse_service_account_json(cred_raw)
             wn = str(sec.get(_SECRET_WORKSHEET_NAME, "") or "").strip() or "mock_portfolio"
+            gid = _parse_gid_from_spreadsheet_url(url)
             if sid and sa:
-                return sid, wn, sa
+                return sid, wn, sa, gid
     except Exception:
         pass
     # --- 로컬 레거시 TOML 블록 ---
@@ -179,7 +193,9 @@ def _mock_gsheets_settings() -> tuple[str, str, dict] | None:
         if _MOCK_GSHEETS_SECRET_SECTION not in sec:
             return None
         raw = sec[_MOCK_GSHEETS_SECRET_SECTION]
-        sid = str(raw.get("spreadsheet_id", "")).strip()
+        sid_raw = str(raw.get("spreadsheet_id", "")).strip()
+        sid = _parse_spreadsheet_id_from_url(sid_raw) or sid_raw
+        gid = _parse_gid_from_spreadsheet_url(sid_raw) if "/" in sid_raw else None
         wname = str(raw.get("worksheet_name", "mock_portfolio")).strip() or "mock_portfolio"
         sa: dict | None = None
         j = raw.get("service_account_json")
@@ -194,7 +210,7 @@ def _mock_gsheets_settings() -> tuple[str, str, dict] | None:
             return None
         if sa.get("type") != "service_account" and "private_key" not in sa:
             return None
-        return sid, wname, sa
+        return sid, wname, sa, gid
     except Exception:
         return None
 
@@ -204,21 +220,81 @@ def _get_mock_portfolio_worksheet():
     parsed = _mock_gsheets_settings()
     if parsed is None:
         return None
-    sid, wname, sa_info = parsed
+    sid, wname, sa_info, sheet_gid = parsed
     try:
         gc = gspread.service_account_from_dict(sa_info, scopes=_GSPREAD_SCOPES)
         sh = gc.open_by_key(sid)
     except Exception:
         return None
+    # URL에 gid가 있으면 그 탭만 쓴다. (gid 조회가 잠깐 실패했을 때 worksheet("mock_portfolio")로
+    # 빈 자동생탭만 잡으면, 잠깐 데이터가 보였다가 비는 증상이 난다.)
+    if sheet_gid is not None:
+        for attempt in range(2):
+            try:
+                return sh.get_worksheet_by_id(sheet_gid)
+            except Exception:
+                if attempt == 0:
+                    time.sleep(0.45)
+        try:
+            return sh.sheet1
+        except Exception:
+            return None
     try:
         return sh.worksheet(wname)
     except gspread.WorksheetNotFound:
+        pass
+    try:
+        return sh.sheet1
+    except Exception:
+        pass
+    try:
+        ws = sh.add_worksheet(title=wname, rows=2000, cols=len(_MOCK_PF_COLS))
+        ws.append_row(_MOCK_PF_COLS, value_input_option=gspread.utils.ValueInputOption.user_entered)
+        return ws
+    except Exception:
+        return None
+
+
+def _mock_portfolio_sheet_cache_key() -> str | None:
+    """시트 읽기 캐시 키 (스프레드시트·탭 단위)."""
+    p = _mock_gsheets_settings()
+    if not p:
+        return None
+    sid, wname, _, gid = p
+    return f"{sid}\x1f{wname}\x1f{gid if gid is not None else 'x'}"
+
+
+@st.cache_data(ttl=12, max_entries=12, show_spinner=False)
+def _cached_mock_portfolio_sheet_values(cache_key: str) -> list[list[str]]:
+    """Google 시트 전체 셀 문자열 (캐시로 반복 조회·fragment 재실행 부담 감소)."""
+    ws = _get_mock_portfolio_worksheet()
+    if ws is None:
+        raise RuntimeError("mock worksheet unavailable")
+    last_exc: Exception | None = None
+    for attempt in range(3):
         try:
-            ws = sh.add_worksheet(title=wname, rows=2000, cols=len(_MOCK_PF_COLS))
-            ws.append_row(_MOCK_PF_COLS, value_input_option=gspread.utils.ValueInputOption.user_entered)
-            return ws
-        except Exception:
-            return None
+            return ws.get_all_values()
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.2 * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("get_all_values failed")
+
+
+def _invalidate_mock_portfolio_sheet_cache() -> None:
+    try:
+        _cached_mock_portfolio_sheet_values.clear()
+    except Exception:
+        pass
+
+
+def _invalidate_mock_price_caches() -> None:
+    """모바일·PC 간 시세가 다르게 보일 때 함께 비울 캐시."""
+    try:
+        _fetch_current_price.clear()
+    except Exception:
+        pass
+
 
 # ============== 날짜 유틸 ==============
 def _to_ymd(d: str) -> str:
@@ -1085,34 +1161,112 @@ def _parse_stock_selection(selection: str) -> tuple[str, str] | None:
     return None
 
 
+def _normalize_mock_sheet_header(h: str) -> str:
+    """시트 헤더 공백·별칭을 표준 컬럼명으로 맞춤 (예전 시트 호환)."""
+    k = re.sub(r"\s+", "", str(h).strip().replace("\ufeff", ""))
+    aliases = {
+        "매수일자": "매수일자",
+        "매수일": "매수일자",
+        "일자": "매수일자",
+        "종목코드": "종목코드",
+        "코드": "종목코드",
+        "티커": "종목코드",
+        "종목명": "종목명",
+        "종목": "종목명",
+        "매수단가": "매수단가",
+        "단가": "매수단가",
+        "가격": "매수단가",
+        "매수수량": "매수수량",
+        "수량": "매수수량",
+        "주식수": "매수수량",
+        "보유수량": "매수수량",
+    }
+    return aliases.get(k, str(h).strip())
+
+
+def _coerce_mock_sheet_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """시트/API는 숫자도 '9,000' 같은 문자로 올 수 있음 → 계산용 숫자로 변환."""
+    d = df.copy()
+    if "매수단가" in d.columns:
+        d["매수단가"] = pd.to_numeric(
+            d["매수단가"].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d.\-]", "", regex=True),
+            errors="coerce",
+        ).fillna(0)
+    if "매수수량" in d.columns:
+        d["매수수량"] = pd.to_numeric(
+            d["매수수량"].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\-]", "", regex=True),
+            errors="coerce",
+        ).fillna(0).astype(int)
+    return d
+
+
+def _mock_portfolio_stable_hash(df: pd.DataFrame) -> str:
+    """시트 원본 vs data_editor 결과 비교용 (종목코드 6자리·단가 소수 자리 등 규칙 통일). 해시 불일치 시 매번 저장→rerun 되며 '계속 실행 중'이 될 수 있음."""
+    if df is None or df.empty:
+        return ""
+    cols = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
+    if not all(c in df.columns for c in cols):
+        return ""
+    d = df[cols].copy()
+    d["매수일자"] = d["매수일자"].astype(str).str.strip()
+    d["종목명"] = d["종목명"].astype(str).str.strip()
+    sc = d["종목코드"].astype(str).str.strip().str.replace(r"\.0$", "", regex=False)
+    nc = pd.to_numeric(sc, errors="coerce")
+    d["종목코드"] = nc.fillna(0).astype(int).astype(str).str.zfill(6)
+    d["매수단가"] = pd.to_numeric(d["매수단가"], errors="coerce").fillna(0).round(2)
+    d["매수수량"] = pd.to_numeric(d["매수수량"], errors="coerce").fillna(0).astype(int)
+    d = d.sort_values(["종목코드", "매수일자"], kind="mergesort").reset_index(drop=True)
+    return d.to_csv(index=False, float_format="%.2f")
+
+
 def _load_mock_portfolio() -> pd.DataFrame:
     """Google Sheets에서 모의 매수 내역 읽기. Secrets/공유 미설정 시 빈 DataFrame."""
-    ws = _get_mock_portfolio_worksheet()
-    if ws is None:
+    rows: list[list[str]] | None = None
+    ck = _mock_portfolio_sheet_cache_key()
+    if ck:
+        try:
+            rows = _cached_mock_portfolio_sheet_values(ck)
+        except Exception:
+            rows = None
+    if rows is None:
+        ws = _get_mock_portfolio_worksheet()
+        if ws is None:
+            return _empty_mock_portfolio_df()
+        for attempt in range(3):
+            try:
+                rows = ws.get_all_values()
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+    if rows is None:
         return _empty_mock_portfolio_df()
-    try:
-        rows = ws.get_all_values()
-    except Exception:
+    if len(rows) < 1:
         return _empty_mock_portfolio_df()
-    if len(rows) < 2:
-        return _empty_mock_portfolio_df()
-    header = [str(x).strip() for x in rows[0]]
-    data = rows[1:]
-    if not header or not data:
+    header_raw = [str(x) for x in rows[0]]
+    header = [_normalize_mock_sheet_header(x) for x in header_raw]
+    data = rows[1:] if len(rows) >= 2 else []
+    if not header:
         return _empty_mock_portfolio_df()
     if "종목코드" not in header:
+        return _empty_mock_portfolio_df()
+    if not data:
         return _empty_mock_portfolio_df()
     try:
         df = pd.DataFrame(data, columns=header)
     except Exception:
         return _empty_mock_portfolio_df()
+    # 동일 표준명 중복 컬럼 방지(병합 등)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     for c in _MOCK_PF_COLS:
         if c not in df.columns:
             df[c] = None
-    return df[_MOCK_PF_COLS].copy()
+    df = df[_MOCK_PF_COLS].copy()
+    df = _coerce_mock_sheet_numeric_columns(df)
+    return df
 
 
-def _save_mock_portfolio(df: pd.DataFrame) -> None:
+def _save_mock_portfolio(df: pd.DataFrame, *, allow_clear_sheet: bool = False) -> None:
     """모의 매수 내역을 Google Sheets에 덮어쓰기 저장."""
     ws = _get_mock_portfolio_worksheet()
     if ws is None:
@@ -1122,6 +1276,11 @@ def _save_mock_portfolio(df: pd.DataFrame) -> None:
         )
 
     if df is None or df.empty:
+        if not allow_clear_sheet:
+            raise RuntimeError(
+                "저장할 유효한 행이 없습니다. 시트 전체를 비우지 않습니다. "
+                "(표에서 값이 잠깐 깨지면 이 저장이 막혀야 합니다.)"
+            )
         body = [_MOCK_PF_COLS]
     else:
         d = df.copy()
@@ -1131,18 +1290,22 @@ def _save_mock_portfolio(df: pd.DataFrame) -> None:
         d = d[_MOCK_PF_COLS]
         body = [_MOCK_PF_COLS]
         for _, r in d.iterrows():
+            pa = str(r["매수단가"]).replace(",", "").strip()
+            qt = str(r["매수수량"]).replace(",", "").strip()
             body.append([
                 str(r["매수일자"]).strip(),
                 str(r["종목코드"]).strip().zfill(6),
                 str(r["종목명"]).strip(),
-                float(pd.to_numeric(r["매수단가"], errors="coerce") or 0),
-                int(pd.to_numeric(r["매수수량"], errors="coerce") or 0),
+                float(pd.to_numeric(pa, errors="coerce") or 0),
+                int(pd.to_numeric(qt, errors="coerce") or 0),
             ])
     try:
         ws.clear()
         ws.update(body, "A1", value_input_option=gspread.utils.ValueInputOption.user_entered)
     except Exception as e:
         raise RuntimeError(f"Google Sheets 저장 실패: {e}") from e
+    _invalidate_mock_portfolio_sheet_cache()
+    _invalidate_mock_price_caches()
 
 
 @st.cache_data(ttl=120)
@@ -1180,16 +1343,30 @@ def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
     if not all(c in raw_df.columns for c in cols):
         return raw_df
     out = raw_df[cols].copy()
-    out["매수단가"] = pd.to_numeric(out["매수단가"], errors="coerce").fillna(0)
-    out["매수수량"] = pd.to_numeric(out["매수수량"], errors="coerce").fillna(0).astype(int)
-    # 고유 종목만 순차 조회 (클라우드/저메모리 환경 부하 완화)
+    out = _coerce_mock_sheet_numeric_columns(out)
     end_date = _get_end_date()
     unique_codes = out["종목코드"].astype(str).str.zfill(6).unique().tolist()
-    price_map = {}
-    for c in unique_codes:
-        p = _fetch_current_price(c, _end_date=end_date)
-        price_map[c] = p if p is not None else 0
-        time.sleep(0.5)
+    price_map: dict[str, float] = {}
+
+    def _fetch_one(code: str) -> tuple[str, float]:
+        p = _fetch_current_price(code, _end_date=end_date)
+        return code, float(p) if p is not None else 0.0
+
+    n = len(unique_codes)
+    workers = min(6, max(1, n))
+    if n <= 1:
+        for c in unique_codes:
+            code, px = _fetch_one(c)
+            price_map[code] = px
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_fetch_one, c) for c in unique_codes]
+            for fut in as_completed(futs):
+                try:
+                    code, px = fut.result()
+                    price_map[code] = px
+                except Exception:
+                    pass
     out["현재가"] = out["종목코드"].astype(str).str.zfill(6).map(lambda c: price_map.get(c, 0))
     out["평가금액"] = out["현재가"] * out["매수수량"]
     out["수익금"] = (out["현재가"] - out["매수단가"]) * out["매수수량"]
@@ -1231,10 +1408,11 @@ def _render_mock_portfolio_inner() -> None:
         pf_etfs["매수단가"] = pf_etfs["매수단가"].astype(float)
 
     save_cols = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
+    # 종목코드·종목명은 동적 행 추가(num_rows=dynamic) 시 비어 있으므로 반드시 편집 가능해야 함
     col_config = {
         "매수일자": st.column_config.TextColumn("매수일자", disabled=False, help="YYYY-MM-DD 형식으로 수정 가능"),
-        "종목코드": st.column_config.TextColumn("종목코드", disabled=True),
-        "종목명": st.column_config.TextColumn("종목명", disabled=True),
+        "종목코드": st.column_config.TextColumn("종목코드", disabled=False, help="6자리 숫자. 행 추가 시 필수"),
+        "종목명": st.column_config.TextColumn("종목명", disabled=False, help="행 추가 시 필수"),
         "매수단가": st.column_config.NumberColumn("매수단가", format="%,.2f", help="직접 수정 가능 (소수점 입력 가능)"),
         "매수수량": st.column_config.NumberColumn("매수수량", format="%d", help="직접 수정 가능"),
         "현재가": st.column_config.NumberColumn("현재가", format="%,d", disabled=True),
@@ -1256,7 +1434,9 @@ def _render_mock_portfolio_inner() -> None:
 
     def _valid_save_df(df: pd.DataFrame) -> pd.DataFrame:
         d = df[save_cols].copy()
-        d["종목코드"] = d["종목코드"].astype(str).str.zfill(6)
+        sc = d["종목코드"].astype(str).str.strip().str.replace(r"\.0$", "", regex=False)
+        nc = pd.to_numeric(sc, errors="coerce")
+        d["종목코드"] = nc.fillna(0).astype(int).astype(str).str.zfill(6)
         d["매수단가"] = d["매수단가"].apply(_parse_price)
         valid = (
             d["종목코드"].str.match(r"^\d{6}$", na=False)
@@ -1267,17 +1447,6 @@ def _render_mock_portfolio_inner() -> None:
         )
         d["매수단가"] = d["매수단가"].round(2)
         return d[valid]
-
-    def _to_csv_hash(d: pd.DataFrame) -> str:
-        cols = [c for c in save_cols if c in d.columns]
-        if not cols:
-            return ""
-        d = d[cols].copy()
-        if "종목코드" in d.columns:
-            d["종목코드"] = d["종목코드"].astype(str).str.zfill(6)
-        if "종목코드" in d.columns and "매수일자" in d.columns:
-            d = d.sort_values(["종목코드", "매수일자"]).reset_index(drop=True)
-        return d.fillna("").astype(str).to_csv(index=False)
 
     edited_stocks = None
     edited_etfs = None
@@ -1293,63 +1462,107 @@ def _render_mock_portfolio_inner() -> None:
             key="mock_stocks_editor",
         )
 
-    if not pf_etfs.empty:
-        st.subheader("📊 ETF")
-        edited_etfs = st.data_editor(
-            pf_etfs,
-            width="stretch",
-            height=min(300, 80 + len(pf_etfs) * 38),
-            hide_index=True,
-            num_rows="dynamic",
-            column_config=col_config,
-            key="mock_etfs_editor",
-        )
-        st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합)")
-        pf_etfs["_code6"] = pf_etfs["종목코드"].astype(str).str.zfill(6)
-        seen_codes = []
-        seen_order = []
-        for _, row in pf_etfs.iterrows():
-            c6 = row["_code6"]
-            if c6 not in seen_codes:
-                seen_codes.append(c6)
-                seen_order.append((c6, row["종목명"]))
-        etf_summary = []
-        for (code6, name) in seen_order:
-            g = pf_etfs[pf_etfs["_code6"] == code6]
-            cost = (g["매수단가"].astype(float) * g["매수수량"].astype(float)).sum()
-            eval_amt = g["평가금액"].astype(float).sum()
-            diff = int(round(eval_amt - cost))
-            ret = (eval_amt - cost) / cost * 100 if cost > 0 else 0
-            etf_summary.append({"종목코드": code6, "종목명": name, "총매수금액": int(round(cost)), "총평가금액": int(round(eval_amt)), "차액": diff, "종합 수익률(%)": round(ret, 2)})
-        pf_etfs = pf_etfs.drop(columns=["_code6"], errors="ignore")
-        if etf_summary:
-            summary_df = pd.DataFrame(etf_summary)
-            tot_cost = summary_df["총매수금액"].sum()
-            tot_eval = summary_df["총평가금액"].sum()
-            tot_ret = (tot_eval - tot_cost) / tot_cost * 100 if tot_cost > 0 else 0
-            tot_diff = int(tot_eval - tot_cost)
-            rows = []
-            for r in etf_summary:
-                구분 = f"{r['종목코드']} {r['종목명']}"
-                rows.append(f"| {구분} | {r['총매수금액']:,} | {r['총평가금액']:,} | {r['차액']:+,} | {r['종합 수익률(%)']:+.2f}% |")
-            rows.append(f"| **ETF 전체** | **{int(tot_cost):,}** | **{int(tot_eval):,}** | **{tot_diff:+,}** | **{tot_ret:+.2f}%** |")
-            tbl = "구분 | 총매수금액 | 총평가금액 | 차액 | 종합 수익률(%)\n" + "--- | --- | --- | --- | ---\n" + "\n".join(rows)
-            st.markdown(tbl)
+    st.subheader("📊 ETF")
+    etf_editor_df = pf_etfs.copy() if not pf_etfs.empty else pd.DataFrame(columns=list(pf.columns))
+    _n_etf = len(etf_editor_df)
+    edited_etfs = st.data_editor(
+        etf_editor_df,
+        width="stretch",
+        height=min(420, 80 + max(_n_etf, 1) * 38),
+        hide_index=True,
+        num_rows="dynamic",
+        column_config=col_config,
+        key="mock_etfs_editor",
+    )
+    st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 코드·종목명·일자·단가·수량을 입력하세요.")
+    _etf_for_summary = edited_etfs if edited_etfs is not None and not edited_etfs.empty else pf_etfs
+    if _etf_for_summary is not None and not _etf_for_summary.empty:
+        _sum_df = _etf_for_summary.copy()
+        _sum_df["_code6"] = _sum_df["종목코드"].astype(str).str.zfill(6)
+        _sum_df = _sum_df[_sum_df["_code6"].isin(etf_codes)]
+        if not _sum_df.empty:
+            seen_codes: list[str] = []
+            seen_order: list[tuple[str, str]] = []
+            for _, row in _sum_df.iterrows():
+                c6 = row["_code6"]
+                if c6 not in seen_codes:
+                    seen_codes.append(c6)
+                    seen_order.append((c6, str(row.get("종목명", "") or "")))
+            etf_summary = []
+            for (code6, name) in seen_order:
+                g = _sum_df[_sum_df["_code6"] == code6]
+                cost = (g["매수단가"].astype(float) * g["매수수량"].astype(float)).sum()
+                eval_amt = g["평가금액"].astype(float).sum()
+                diff = int(round(eval_amt - cost))
+                ret = (eval_amt - cost) / cost * 100 if cost > 0 else 0
+                etf_summary.append({"종목코드": code6, "종목명": name, "총매수금액": int(round(cost)), "총평가금액": int(round(eval_amt)), "차액": diff, "종합 수익률(%)": round(ret, 2)})
+            if etf_summary:
+                summary_df = pd.DataFrame(etf_summary)
+                tot_cost = summary_df["총매수금액"].sum()
+                tot_eval = summary_df["총평가금액"].sum()
+                tot_ret = (tot_eval - tot_cost) / tot_cost * 100 if tot_cost > 0 else 0
+                tot_diff = int(tot_eval - tot_cost)
+                rows = []
+                for r in etf_summary:
+                    구분 = f"{r['종목코드']} {r['종목명']}"
+                    rows.append(f"| {구분} | {r['총매수금액']:,} | {r['총평가금액']:,} | {r['차액']:+,} | {r['종합 수익률(%)']:+.2f}% |")
+                rows.append(f"| **ETF 전체** | **{int(tot_cost):,}** | **{int(tot_eval):,}** | **{tot_diff:+,}** | **{tot_ret:+.2f}%** |")
+                tbl = "구분 | 총매수금액 | 총평가금액 | 차액 | 종합 수익률(%)\n" + "--- | --- | --- | --- | ---\n" + "\n".join(rows)
+                st.markdown(tbl)
 
     parts = []
     if edited_stocks is not None and not edited_stocks.empty:
         parts.append(_valid_save_df(edited_stocks))
     if edited_etfs is not None and not edited_etfs.empty:
         parts.append(_valid_save_df(edited_etfs))
-    if parts:
-        save_df = pd.concat(parts, ignore_index=True)
-        if _to_csv_hash(save_df) != _to_csv_hash(raw_inner):
-            try:
-                _save_mock_portfolio(save_df)
-            except RuntimeError as e:
-                st.error(str(e))
-            else:
-                st.rerun()
+    save_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if (edited_stocks is not None and not edited_stocks.empty) or (edited_etfs is not None and not edited_etfs.empty):
+        if save_df.empty and not raw_inner.empty:
+            st.warning(
+                "편집 내용에서 **저장 가능한 행이 없습니다** (날짜·코드·종목명·단가·수량 형식 확인). "
+                "**Google 시트는 그대로 두었습니다.**"
+            )
+    pending_hash = _mock_portfolio_stable_hash(save_df) if not save_df.empty else ""
+    sheet_hash = _mock_portfolio_stable_hash(raw_inner)
+    has_pending_sheet_save = bool(pending_hash and pending_hash != sheet_hash)
+    if has_pending_sheet_save:
+        st.warning(
+            "표를 수정했습니다. **Google 시트에 반영**하려면 아래 **저장** 버튼을 누르세요. "
+            "(자동 저장은 하지 않습니다 — 실행 중 루프를 막기 위함입니다.)"
+        )
+    if st.button(
+        "💾 Google 시트에 저장",
+        type="primary",
+        key="mock_push_sheet_button",
+        disabled=not has_pending_sheet_save,
+        help="표의 매수일·단가·수량 변경만 시트에 반영됩니다.",
+    ):
+        try:
+            _save_mock_portfolio(save_df)
+        except RuntimeError as e:
+            st.error(str(e))
+        else:
+            st.success("시트에 저장했습니다.")
+            st.rerun()
+
+    def _code6_series(ser: pd.Series) -> pd.Series:
+        s = ser.astype(str).str.strip().str.replace(r"\.0$", "", regex=False)
+        n = pd.to_numeric(s, errors="coerce")
+        return n.fillna(0).astype(int).astype(str).str.zfill(6)
+
+    if edited_stocks is not None and not edited_stocks.empty:
+        _s = edited_stocks.copy()
+        _s["_c6"] = _code6_series(_s["종목코드"])
+        pf_stocks_m = _s[~_s["_c6"].isin(etf_codes)].drop(columns=["_c6"], errors="ignore")
+    else:
+        pf_stocks_m = pf_stocks
+
+    if edited_etfs is not None and not edited_etfs.empty:
+        _e = edited_etfs.copy()
+        _e["_c6"] = _code6_series(_e["종목코드"])
+        pf_etfs_m = _e[_e["_c6"].isin(etf_codes)].drop(columns=["_c6"], errors="ignore")
+    else:
+        pf_etfs_m = pf_etfs
 
     total_qty = int(pf["매수수량"].sum())
     total_cost = (pf["매수단가"] * pf["매수수량"]).sum()
@@ -1364,8 +1577,8 @@ def _render_mock_portfolio_inner() -> None:
         ret = (eval_amt - cost) / cost * 100 if cost > 0 else 0
         return cost, eval_amt, ret
 
-    stock_cost, stock_eval, stock_return = _calc_return(pf_stocks)
-    etf_cost, etf_eval, etf_return = _calc_return(pf_etfs)
+    stock_cost, stock_eval, stock_return = _calc_return(pf_stocks_m)
+    etf_cost, etf_eval, etf_return = _calc_return(pf_etfs_m)
 
     st.divider()
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -1378,9 +1591,9 @@ def _render_mock_portfolio_inner() -> None:
     with c4:
         st.metric("전체 수익률", f"{total_return_pct:+.2f}%")
     with c5:
-        st.metric("주식 수익률", f"{stock_return:+.2f}%" if not pf_stocks.empty else "—")
+        st.metric("주식 수익률", f"{stock_return:+.2f}%" if not pf_stocks_m.empty else "—")
     with c6:
-        st.metric("ETF 수익률", f"{etf_return:+.2f}%" if not pf_etfs.empty else "—")
+        st.metric("ETF 수익률", f"{etf_return:+.2f}%" if not pf_etfs_m.empty else "—")
 
 
 # ============== Streamlit UI ==============
@@ -1675,6 +1888,21 @@ with tab2:
             "표에서 매수 정보를 수정할 때는 갱신 때문에 저장하지 않은 편집이 덮어씌워질 수 있으니, 수정 중에는 자동 갱신을 끄는 것을 권장합니다. "
             "가격 갱신은 이 탭의 포트폴리오 블록만 다시 그리므로, 1탭 분석 전체가 반복 실행되지는 않습니다(Streamlit 1.33+ 필요)."
         )
+
+    if _mock_gsheets_configured() and _get_mock_portfolio_worksheet() is not None:
+        st.caption(
+            "📱 **스마트폰**에서 PC와 다르게 보이면: 아래 **다시 불러오기**를 누른 뒤, 그래도 같으면 브라우저에서 이 주소의 **캐시/사이트 데이터 삭제**를 해 보세요. "
+            "PC는 `localhost`로 열고 폰은 **같은 주소**로 열어야 합니다(집 PC면 `http://PC_IP:8501`, **Streamlit Cloud**면 배포 URL만 둘 다 사용)."
+        )
+        if st.button(
+            "🔄 시트·시세 캐시 무시하고 다시 불러오기",
+            key="mock_sheet_hard_refresh",
+            use_container_width=True,
+            help="Google 시트 내용과 현재가 캐시를 비우고 최신으로 가져옵니다.",
+        ):
+            _invalidate_mock_portfolio_sheet_cache()
+            _invalidate_mock_price_caches()
+            st.rerun()
 
     # 2~3글자만 입력하면 드롭다운으로 매칭 종목 표시 (ETF 등 긴 이름 입력 편의)
     stock_options = _get_krx_stock_options()
