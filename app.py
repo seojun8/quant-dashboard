@@ -13,16 +13,17 @@ except ImportError:
 
 _curl_cffi_disabled = False  # invalid library 등으로 실패 시 requests로 폴백
 
+import json
 import random
 import re
 import time
 from datetime import datetime, timedelta
 from io import StringIO
-from pathlib import Path
-
+import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 # pykrx: 수급/시총 | FinanceDataReader: 장기 가격 | 네이버: 재무제표
 try:
@@ -41,12 +42,183 @@ from bs4 import BeautifulSoup
 # SSL 인증서 검증 우회 시 InsecureRequestWarning 경고 숨김
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 모의 투자 CSV 경로 (app.py와 같은 폴더)
-try:
-    _APP_DIR = Path(__file__).resolve().parent
-except NameError:
-    _APP_DIR = Path(".")
-MOCK_PORTFOLIO_PATH = _APP_DIR / "mock_portfolio.csv"
+# 모의 투자: Google Sheets 영구 저장
+# - Streamlit Cloud: Secrets 에 SPREADSHEET_URL, GOOGLE_CREDENTIALS(JSON 문자열) [, WORKSHEET_NAME]
+# - 로컬(레거시): .streamlit/secrets.toml 의 [mock_portfolio_gsheets] 테이블
+_MOCK_PF_COLS = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
+_MOCK_GSHEETS_SECRET_SECTION = "mock_portfolio_gsheets"
+_SECRET_SPREADSHEET_URL = "SPREADSHEET_URL"
+_SECRET_GOOGLE_CREDENTIALS = "GOOGLE_CREDENTIALS"
+_SECRET_WORKSHEET_NAME = "WORKSHEET_NAME"
+_GSPREAD_SCOPES = (
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+)
+
+
+def _streamlit_secrets_or_none():
+    """secrets 파일이 없으면 None (접근 시 StreamlitSecretNotFoundError 방지)."""
+    try:
+        return st.secrets
+    except StreamlitSecretNotFoundError:
+        return None
+
+
+def _mock_gsheets_configured() -> bool:
+    """Cloud 플랫 키 또는 레거시 mock_portfolio_gsheets 블록이 있으면 True."""
+    sec = _streamlit_secrets_or_none()
+    if sec is None:
+        return False
+    try:
+        url = str(sec.get(_SECRET_SPREADSHEET_URL, "") or "").strip()
+        cred = sec.get(_SECRET_GOOGLE_CREDENTIALS)
+        if url and cred is not None and str(cred).strip():
+            return True
+    except Exception:
+        pass
+    try:
+        return _MOCK_GSHEETS_SECRET_SECTION in sec
+    except Exception:
+        return False
+
+
+def _parse_spreadsheet_id_from_url(url_or_id: str) -> str | None:
+    """스프레드시트 공유 URL에서 ID 추출. ID만 넣은 경우도 허용."""
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9_-]+", s) and len(s) >= 10:
+        return s
+    return None
+
+
+def _parse_service_account_json(raw) -> dict | None:
+    """GOOGLE_CREDENTIALS: 삼중따옴표/백틱/Code fence 제거 후 JSON 파싱."""
+    if raw is None:
+        return None
+    t = str(raw).strip()
+    for _ in range(3):
+        if t.startswith("```"):
+            t = t[3:]
+            if t.lstrip().lower().startswith("json"):
+                t = t[4:].lstrip()
+            t = t.strip()
+        if t.endswith("```"):
+            t = t[:-3].strip()
+    if t.startswith("'''"):
+        t = t[3:]
+    if t.endswith("'''"):
+        t = t[:-3]
+    t = t.strip()
+    if t.startswith('"""'):
+        t = t[3:]
+    if t.endswith('"""'):
+        t = t[:-3]
+    t = t.strip().strip("`").strip()
+    try:
+        d = json.loads(t)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    if d.get("type") == "service_account":
+        return d
+    if "private_key" in d and "client_email" in d:
+        return d
+    return None
+
+
+def _empty_mock_portfolio_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=_MOCK_PF_COLS)
+
+
+def _toml_like_to_dict(obj) -> dict:
+    """Streamlit secrets의 dict/AttrDict를 서비스 계정용 일반 dict로 재귀 변환."""
+
+    def conv(x):
+        if x is None:
+            return None
+        if isinstance(x, dict):
+            return {str(k): conv(v) for k, v in x.items()}
+        if hasattr(x, "keys") and callable(x.keys) and not isinstance(x, (str, bytes, int, float, bool)):
+            try:
+                return {str(k): conv(x[k]) for k in x.keys()}
+            except Exception:
+                return x
+        return x
+
+    r = conv(obj)
+    return r if isinstance(r, dict) else {}
+
+
+def _mock_gsheets_settings() -> tuple[str, str, dict] | None:
+    """
+    우선순위: (1) SPREADSHEET_URL + GOOGLE_CREDENTIALS (2) [mock_portfolio_gsheets] 테이블.
+    반환: (spreadsheet_id, worksheet_name, service_account_dict)
+    """
+    sec = _streamlit_secrets_or_none()
+    if sec is None:
+        return None
+    # --- Streamlit Cloud 등 플랫 Secrets ---
+    try:
+        url = str(sec.get(_SECRET_SPREADSHEET_URL, "") or "").strip()
+        cred_raw = sec.get(_SECRET_GOOGLE_CREDENTIALS)
+        if url and cred_raw is not None and str(cred_raw).strip():
+            sid = _parse_spreadsheet_id_from_url(url)
+            sa = _parse_service_account_json(cred_raw)
+            wn = str(sec.get(_SECRET_WORKSHEET_NAME, "") or "").strip() or "mock_portfolio"
+            if sid and sa:
+                return sid, wn, sa
+    except Exception:
+        pass
+    # --- 로컬 레거시 TOML 블록 ---
+    try:
+        if _MOCK_GSHEETS_SECRET_SECTION not in sec:
+            return None
+        raw = sec[_MOCK_GSHEETS_SECRET_SECTION]
+        sid = str(raw.get("spreadsheet_id", "")).strip()
+        wname = str(raw.get("worksheet_name", "mock_portfolio")).strip() or "mock_portfolio"
+        sa: dict | None = None
+        j = raw.get("service_account_json")
+        if j is not None and str(j).strip():
+            try:
+                sa = json.loads(str(j).strip())
+            except json.JSONDecodeError:
+                sa = None
+        if sa is None and raw.get("credentials") is not None:
+            sa = _toml_like_to_dict(raw["credentials"])
+        if not sid or not sa:
+            return None
+        if sa.get("type") != "service_account" and "private_key" not in sa:
+            return None
+        return sid, wname, sa
+    except Exception:
+        return None
+
+
+def _get_mock_portfolio_worksheet():
+    """서비스 계정으로 스프레드시트를 연 뒤 워크시트 반환. 설정 오류 시 None."""
+    parsed = _mock_gsheets_settings()
+    if parsed is None:
+        return None
+    sid, wname, sa_info = parsed
+    try:
+        gc = gspread.service_account_from_dict(sa_info, scopes=_GSPREAD_SCOPES)
+        sh = gc.open_by_key(sid)
+    except Exception:
+        return None
+    try:
+        return sh.worksheet(wname)
+    except gspread.WorksheetNotFound:
+        try:
+            ws = sh.add_worksheet(title=wname, rows=2000, cols=len(_MOCK_PF_COLS))
+            ws.append_row(_MOCK_PF_COLS, value_input_option=gspread.utils.ValueInputOption.user_entered)
+            return ws
+        except Exception:
+            return None
 
 # ============== 날짜 유틸 ==============
 def _to_ymd(d: str) -> str:
@@ -914,22 +1086,63 @@ def _parse_stock_selection(selection: str) -> tuple[str, str] | None:
 
 
 def _load_mock_portfolio() -> pd.DataFrame:
-    """mock_portfolio.csv 읽기. 없으면 빈 DataFrame 반환 후 자동 생성."""
-    if not MOCK_PORTFOLIO_PATH.exists():
-        default_df = pd.DataFrame(columns=["매수일자", "종목코드", "종목명", "매수단가", "매수수량"])
-        default_df.to_csv(MOCK_PORTFOLIO_PATH, index=False, encoding="utf-8-sig")
-        return default_df
+    """Google Sheets에서 모의 매수 내역 읽기. Secrets/공유 미설정 시 빈 DataFrame."""
+    ws = _get_mock_portfolio_worksheet()
+    if ws is None:
+        return _empty_mock_portfolio_df()
     try:
-        return pd.read_csv(MOCK_PORTFOLIO_PATH, encoding="utf-8-sig")
+        rows = ws.get_all_values()
     except Exception:
-        return pd.DataFrame(columns=["매수일자", "종목코드", "종목명", "매수단가", "매수수량"])
+        return _empty_mock_portfolio_df()
+    if len(rows) < 2:
+        return _empty_mock_portfolio_df()
+    header = [str(x).strip() for x in rows[0]]
+    data = rows[1:]
+    if not header or not data:
+        return _empty_mock_portfolio_df()
+    if "종목코드" not in header:
+        return _empty_mock_portfolio_df()
+    try:
+        df = pd.DataFrame(data, columns=header)
+    except Exception:
+        return _empty_mock_portfolio_df()
+    for c in _MOCK_PF_COLS:
+        if c not in df.columns:
+            df[c] = None
+    return df[_MOCK_PF_COLS].copy()
 
 
 def _save_mock_portfolio(df: pd.DataFrame) -> None:
-    """모의 매수 내역을 CSV에 저장."""
+    """모의 매수 내역을 Google Sheets에 덮어쓰기 저장."""
+    ws = _get_mock_portfolio_worksheet()
+    if ws is None:
+        raise RuntimeError(
+            "Google Sheets 연동 실패: Secrets에 SPREADSHEET_URL·GOOGLE_CREDENTIALS를 확인하거나, "
+            "레거시 mock_portfolio_gsheets 블록·서비스 계정 공유(편집자)를 확인하세요."
+        )
+
     if df is None or df.empty:
-        df = pd.DataFrame(columns=["매수일자", "종목코드", "종목명", "매수단가", "매수수량"])
-    df.to_csv(MOCK_PORTFOLIO_PATH, index=False, encoding="utf-8-sig")
+        body = [_MOCK_PF_COLS]
+    else:
+        d = df.copy()
+        for c in _MOCK_PF_COLS:
+            if c not in d.columns:
+                d[c] = None
+        d = d[_MOCK_PF_COLS]
+        body = [_MOCK_PF_COLS]
+        for _, r in d.iterrows():
+            body.append([
+                str(r["매수일자"]).strip(),
+                str(r["종목코드"]).strip().zfill(6),
+                str(r["종목명"]).strip(),
+                float(pd.to_numeric(r["매수단가"], errors="coerce") or 0),
+                int(pd.to_numeric(r["매수수량"], errors="coerce") or 0),
+            ])
+    try:
+        ws.clear()
+        ws.update(body, "A1", value_input_option=gspread.utils.ValueInputOption.user_entered)
+    except Exception as e:
+        raise RuntimeError(f"Google Sheets 저장 실패: {e}") from e
 
 
 @st.cache_data(ttl=120)
@@ -1131,8 +1344,12 @@ def _render_mock_portfolio_inner() -> None:
     if parts:
         save_df = pd.concat(parts, ignore_index=True)
         if _to_csv_hash(save_df) != _to_csv_hash(raw_inner):
-            _save_mock_portfolio(save_df)
-            st.rerun()
+            try:
+                _save_mock_portfolio(save_df)
+            except RuntimeError as e:
+                st.error(str(e))
+            else:
+                st.rerun()
 
     total_qty = int(pf["매수수량"].sum())
     total_cost = (pf["매수단가"] * pf["매수수량"]).sum()
@@ -1424,7 +1641,17 @@ with tab1:
 
 with tab2:
     st.subheader("📋 모의 투자 포트폴리오")
-    st.caption("발굴한 종목을 모의 매수하고 수익률을 추적합니다.")
+    st.caption("발굴한 종목을 모의 매수하고 수익률을 추적합니다. 기록은 **Google Sheets**에 저장되어 PC·스마트폰·클라우드 재시작 후에도 유지됩니다.")
+    if not _mock_gsheets_configured():
+        st.error(
+            "**Google Sheets 연동 정보가 없습니다.** Streamlit Cloud → **Settings → Secrets**에 "
+            "`SPREADSHEET_URL`(시트 공유 URL 또는 스프레드시트 ID), `GOOGLE_CREDENTIALS`(서비스 계정 JSON 전체 문자열)를 넣으세요. "
+            "선택: `WORKSHEET_NAME`(기본값 `mock_portfolio`). 로컬은 `.streamlit/secrets.toml`에 동일 키 또는 `[mock_portfolio_gsheets]` 테이블을 사용할 수 있습니다."
+        )
+    elif _get_mock_portfolio_worksheet() is None:
+        st.error(
+            "**스프레드시트에 연결할 수 없습니다.** URL·JSON 형식, **서비스 계정 이메일**을 해당 시트에 **편집자**로 공유했는지 확인하세요."
+        )
     _c_ar1, _c_ar2 = st.columns([3, 1])
     with _c_ar1:
         _mock_auto_price = st.checkbox(
@@ -1499,9 +1726,13 @@ with tab2:
                         "매수단가": round(float(price), 2),
                         "매수수량": int(qty),
                     }])
-                    _save_mock_portfolio(pd.concat([raw, row], ignore_index=True))
-                    st.success(f"✅ {name}({code}) {qty}주 @ {price:,.2f}원 모의 매수 추가됨.")
-                    st.rerun()
+                    try:
+                        _save_mock_portfolio(pd.concat([raw, row], ignore_index=True))
+                    except RuntimeError as e:
+                        st.error(str(e))
+                    else:
+                        st.success(f"✅ {name}({code}) {qty}주 @ {price:,.2f}원 모의 매수 추가됨.")
+                        st.rerun()
                 else:
                     st.warning("종목 형식 오류. '종목명 (종목코드)' 형식으로 선택해 주세요.")
             else:
