@@ -1054,6 +1054,101 @@ def run_full_analysis(end_date: str, progress_callback=None) -> tuple[pd.DataFra
     return result_df, price_info, fin_info, stage_counts, stage2_df, finance_error_log
 
 
+def _pykrx_find_name_cap_columns(cap_df: pd.DataFrame) -> tuple[str | None, str | None]:
+    """get_market_cap_by_ticker 결과의 종목명·시가총액 컬럼 추론 (pykrx/로케일 편차 대응)."""
+    name_col = None
+    cap_col = None
+    for c in cap_df.columns:
+        cs = str(c)
+        lcs = cs.lower()
+        if name_col is None and ("종목명" in cs or "종목" == cs or lcs in ("name", "stock name")):
+            name_col = c
+        if cap_col is None and ("시가총" in cs or "marcap" in lcs):
+            cap_col = c
+    if name_col is None and len(cap_df.columns) > 0:
+        # 흔한 폴백: 첫 번째 문자열형이 이름
+        for c in cap_df.columns:
+            if cap_df[c].dtype == object or str(cap_df[c].dtype) == "string":
+                name_col = c
+                break
+    return name_col, cap_col
+
+
+def _pykrx_ticker_from_row(cap_df: pd.DataFrame, idx, row: pd.Series) -> str | None:
+    """인덱스가 티커가 아닌 표에서 티커 열 탐색."""
+    if not isinstance(cap_df.index, pd.RangeIndex):
+        return str(idx).strip().zfill(6)
+    for c in cap_df.columns:
+        cs = str(c).lower()
+        if "티커" in str(c) or "symbol" in cs or str(c) in ("Code", "code", "종목코드"):
+            v = row.get(c)
+            if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                s = str(v).strip()
+                if s.replace(".", "").replace("-", "").isdigit():
+                    return s.split(".")[0].zfill(6)
+    return None
+
+
+def _fallback_tickers_pykrx(
+    end_date: str,
+    min_mcap_billion: float,
+    max_mcap_trillion: float,
+    max_stocks: int,
+) -> pd.DataFrame | None:
+    """
+    pykrx get_market_cap_by_ticker 로 유니버스 생성 (Streamlit Cloud에서 FDR/KRX 웹 차단 시).
+    """
+    if not PYKRX_AVAILABLE:
+        return None
+    dt = datetime.strptime(end_date, "%Y%m%d")
+    for _ in range(12):
+        d_str = dt.strftime("%Y%m%d")
+        all_rows: list[dict] = []
+        for market, mlabel in (("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")):
+            try:
+                cap_df = pykrx_stock.get_market_cap_by_ticker(d_str, market=market)
+            except Exception:
+                cap_df = None
+            if cap_df is None or cap_df.empty:
+                continue
+            name_col, cap_col = _pykrx_find_name_cap_columns(cap_df)
+            if name_col is None or cap_col is None:
+                continue
+            for idx in cap_df.index:
+                try:
+                    row = cap_df.loc[idx]
+                    t6 = _pykrx_ticker_from_row(cap_df, idx, row)
+                    if not t6 or len(t6) != 6 or not t6.isdigit():
+                        continue
+                    nm = row[name_col]
+                    marcap = float(row[cap_col])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if pd.isna(nm) or marcap <= 0:
+                    continue
+                all_rows.append({"Code": t6, "Name": str(nm).strip(), "Marcap": marcap, "Market": mlabel})
+        if all_rows:
+            krx = pd.DataFrame(all_rows)
+            krx = krx.dropna(subset=["Marcap"])
+            krx = krx[~krx["Name"].fillna("").apply(_is_special_sector)]
+            if min_mcap_billion < 0:
+                filtered = krx.copy()
+            else:
+                min_val = min_mcap_billion * 1e8
+                max_val = max_mcap_trillion * 1e12
+                mask = (krx["Marcap"] >= min_val) & (krx["Marcap"] <= max_val)
+                filtered = krx[mask]
+            if max_stocks and max_stocks > 0:
+                filtered = filtered.nlargest(max_stocks, "Marcap")
+            return pd.DataFrame({
+                "ticker": filtered["Code"].astype(str).str.zfill(6),
+                "name": filtered["Name"].fillna(""),
+            })
+        dt -= timedelta(days=1)
+        time.sleep(0.15)
+    return None
+
+
 def _fallback_tickers(
     _end_date: str,
     min_mcap_billion: float = 500,
@@ -1065,18 +1160,30 @@ def _fallback_tickers(
     min_mcap_billion=-1: 시총 무시, 전체 상장 종목.
     max_stocks=0: 제한 없음, 필터링된 전체 종목.
     """
-    for attempt in range(3):
+    # pykrx 우선 — Streamlit Cloud 등에서 FinanceDataReader(KRX 웹)가 자주 실패함
+    alt = _fallback_tickers_pykrx(_end_date, min_mcap_billion, max_mcap_trillion, max_stocks)
+    if alt is not None and not alt.empty:
+        return alt
+
+    krx = None
+    last_err: Exception | None = None
+    for attempt in range(2):
         try:
             krx = fdr.StockListing("KRX")
-            time.sleep(0.5)
+            time.sleep(0.4)
             break
         except Exception as e:
-            if attempt == 2:
-                raise RuntimeError(
-                    f"KRX 데이터를 불러올 수 없습니다 (홈페이지 접속 실패). "
-                    f"나중에 다시 시도하시거나, pip install --upgrade finance-datareader 로 업데이트해보세요. 원인: {e}"
-                ) from e
-            time.sleep(2)
+            last_err = e
+            if attempt < 1:
+                time.sleep(1)
+    if krx is None:
+        raise RuntimeError(
+            "증권(코스피·코스닥) **종목·시총** 목록을 가져오지 못했습니다.\n\n"
+            "• **Streamlit Cloud**: `FinanceDataReader`가 KRX 웹(`data.krx.co.kr`)에 붙지 못하는 경우가 많습니다. "
+            "이 배포는 **pykrx**로 먼저 조회합니다 — **requirements.txt에 pykrx**가 있고, **GitHub에 푸시 후 Cloud가 재배포**됐는지 확인하세요.\n"
+            "• 에러 글에 **「홈페이지 접속 실패」만** 있고 위 설명이 없으면 **옛 빌드**를 보고 있는 것입니다.\n"
+            f"• (FDR 마지막 오류) {last_err}"
+        ) from last_err
     krx = krx[krx["Market"].isin(["KOSPI", "KOSDAQ"])]
     krx = krx.dropna(subset=["Marcap"])
     # 특수 업종(스팩, 우선주, 리츠, 금융주 등) 제외
@@ -1096,6 +1203,45 @@ def _fallback_tickers(
         "ticker": filtered["Code"].astype(str).str.zfill(6),
         "name": filtered["Name"].fillna(""),
     })
+
+
+def _pykrx_etf_ticker_names(end_date: str) -> list[tuple[str, str]]:
+    """pykrx ETF 코드·이름 (FinanceDataReader ETF/KR 실패 시 보조)."""
+    if not PYKRX_AVAILABLE:
+        return []
+    fn = getattr(pykrx_stock, "get_etf_ticker_list", None)
+    if not callable(fn):
+        return []
+    dt = datetime.strptime(end_date, "%Y%m%d")
+    for _ in range(8):
+        d = dt.strftime("%Y%m%d")
+        tickers = None
+        try:
+            tickers = fn(d)
+        except TypeError:
+            try:
+                tickers = fn()
+            except Exception:
+                tickers = None
+        except Exception:
+            tickers = None
+        if tickers:
+            out: list[tuple[str, str]] = []
+            for t in tickers:
+                t6 = str(t).strip().zfill(6)
+                if not (len(t6) == 6 and t6.isdigit()):
+                    continue
+                try:
+                    nm = pykrx_stock.get_market_ticker_name(t)
+                except Exception:
+                    nm = ""
+                nm = str(nm).strip()
+                if nm:
+                    out.append((t6, nm))
+            return out
+        dt -= timedelta(days=1)
+        time.sleep(0.1)
+    return []
 
 
 # ============== 모의 투자 포트폴리오 (CSV) ==============
@@ -1128,6 +1274,27 @@ def _get_krx_stock_options() -> list[str]:
             pass
     except Exception:
         pass
+    if not result and PYKRX_AVAILABLE:
+        try:
+            alt = _fallback_tickers_pykrx(_get_end_date(), -1.0, 99999.0, 0)
+            if alt is not None and not alt.empty:
+                result = [f"{row['name']} ({row['ticker']})" for _, row in alt.iterrows()]
+        except Exception:
+            pass
+    if PYKRX_AVAILABLE and result:
+        have = set()
+        for s in result:
+            m = re.search(r"\(([0-9]{6})\)\s*$", s)
+            if m:
+                have.add(m.group(1))
+        for t6, nm in _pykrx_etf_ticker_names(_get_end_date()):
+            if t6 not in have and nm:
+                result.append(f"{nm} ({t6})")
+                have.add(t6)
+    elif PYKRX_AVAILABLE and not result:
+        for t6, nm in _pykrx_etf_ticker_names(_get_end_date()):
+            if nm:
+                result.append(f"{nm} ({t6})")
     return result
 
 
@@ -1145,6 +1312,10 @@ def _get_etf_codes() -> frozenset[str]:
                     codes.add(c)
     except Exception:
         pass
+    if not codes and PYKRX_AVAILABLE:
+        for t6, _nm in _pykrx_etf_ticker_names(_get_end_date()):
+            if len(t6) == 6 and t6.isdigit():
+                codes.add(t6)
     return frozenset(codes)
 
 
