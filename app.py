@@ -23,8 +23,10 @@ import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit.errors import StreamlitSecretNotFoundError
+
+# 브라우저 탭·모바일 홈 화면 바로가기 제목/아이콘 (앱 내 첫 st.* 호출이어야 함)
+st.set_page_config(page_title="주식투자", page_icon="📈", layout="wide")
 
 # pykrx: 수급/시총 | FinanceDataReader: 장기 가격 | 네이버: 재무제표
 try:
@@ -1731,7 +1733,7 @@ def _build_portfolio_total_daily_return_pct_series(lots: pd.DataFrame, end_ymd: 
 def _render_portfolio_return_chart_outside_fragment() -> None:
     """
     포트폴리오 전체 일별 수익률(단일 선). st.fragment 밖에서 렌더.
-    가로 폭을 길게 잡고 div overflow-x로 모바일에서 좌우 스크롤 가능.
+    모바일: use_container_width + 고정 높이, Y축 눈자 제한, X축 날짜만(YY-MM-DD), 범례 하단.
     """
     payload = st.session_state.get(_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY)
     if not payload or not isinstance(payload, dict):
@@ -1745,44 +1747,64 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
         st.subheader("📉 포트폴리오 전체 수익률 (종가)")
         st.info("차트를 그리기 위한 시세 이력을 불러오지 못했습니다. 잠시 후 **다시 불러오기**를 눌러 보세요.")
         return
-    n = len(ser_ret)
-    plot_w = int(max(1100, min(9000, n * 12)))
     fig = go.Figure(
         data=[
             go.Scatter(
                 x=ser_ret.index,
                 y=ser_ret.values.astype(float),
                 mode="lines",
-                name="전체",
+                name="전체 수익률",
                 line=dict(width=2, color="#2563eb"),
-                hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}%<extra></extra>",
+                hovertemplate="%{x|%y-%m-%d}<br>%{y:.2f}%<extra></extra>",
             )
         ]
     )
     fig.update_layout(
-        title="포트폴리오 전체 일별 수익률 (종가·분할매수 반영)",
+        title=dict(text="포트폴리오 전체 일별 수익률 (종가·분할매수 반영)", font=dict(size=15)),
         xaxis_title="날짜",
         yaxis_title="수익률 (%)",
-        height=400,
-        width=plot_w,
+        height=450,
+        autosize=True,
         template="plotly_white",
-        showlegend=False,
-        margin=dict(l=56, r=24, t=56, b=48),
-        yaxis=dict(tickformat=".2f", zeroline=True, zerolinewidth=1, zerolinecolor="#bbb"),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+            bgcolor="rgba(255,255,255,0.85)",
+        ),
+        margin=dict(l=36, r=12, t=40, b=88),
     )
-    fig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
-    cfg = {"scrollZoom": False, "displayModeBar": True, "responsive": False}
-    inner = fig.to_html(full_html=False, include_plotlyjs="cdn", config=cfg)
-    wrapped = (
-        "<div style=\"width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:8px;\">"
-        f"<div style=\"min-width:{plot_w}px;\">{inner}</div></div>"
+    fig.update_xaxes(
+        type="date",
+        tickformat="%y-%m-%d",
+        nticks=10,
+        tickangle=-35,
+        automargin=True,
+        showgrid=True,
+    )
+    fig.update_yaxes(
+        nticks=6,
+        tickformat=".2f",
+        automargin=True,
+        zeroline=True,
+        zerolinewidth=1,
+        zerolinecolor="#888",
+        showgrid=True,
     )
     st.subheader("📉 포트폴리오 전체 수익률 (종가)")
     st.caption(
         "표에 있는 **주식·ETF 전체 매수 행**을 합산합니다. 각 거래일마다 종목별 종가×보유수량의 합을 "
-        "그날까지의 누적 매수금액으로 나눈 뒤 수익률(%)로 표시합니다. 가로로 밀어 스크롤해 보세요."
+        "그날까지의 누적 매수금액으로 나눈 뒤 수익률(%)로 표시합니다."
     )
-    components.html(wrapped, height=460, scrolling=True)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        theme=None,
+        config={"scrollZoom": False, "displayModeBar": True},
+    )
 
 
 def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -2073,8 +2095,6 @@ def _render_mock_portfolio_inner() -> None:
 
 
 # ============== Streamlit UI ==============
-st.set_page_config(page_title="퀀트 투자 대시보드", layout="wide")
-
 # 기본 글자 크기 (적당한 가독성)
 st.markdown("""
 <style>
