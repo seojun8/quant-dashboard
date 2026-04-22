@@ -1772,7 +1772,7 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
         ]
     )
     fig.update_layout(
-        title=dict(text="포트폴리오 전체 일별 수익률 (종가·분할매수 반영)", font=dict(size=15)),
+        title=None,
         xaxis_title="날짜",
         yaxis_title="수익률 (%)",
         height=450,
@@ -1787,7 +1787,7 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
             x=0.5,
             bgcolor="rgba(255,255,255,0.85)",
         ),
-        margin=dict(l=36, r=12, t=40, b=88),
+        margin=dict(l=36, r=12, t=28, b=88),
     )
     # tickformat만 지정하고 nticks는 두지 않아 Plotly가 간격 자동 배치 (모바일 겹침 완화)
     fig.update_xaxes(
@@ -1807,11 +1807,12 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
         zerolinecolor="#888",
         showgrid=True,
     )
-    st.subheader("📉 포트폴리오 전체 수익률 (종가)")
+    st.subheader("📉 포트폴리오 전체 일별 수익률 (종가·분할매수 반영)")
     st.caption(
         "표에 있는 **주식·ETF 전체 매수 행**을 합산합니다. 각 거래일마다 종목별 종가×보유수량의 합을 "
         "그날까지의 누적 매수금액으로 나눈 뒤 수익률(%)로 표시합니다."
     )
+    st.divider()
     st.plotly_chart(
         fig,
         use_container_width=True,
