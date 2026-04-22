@@ -17,7 +17,6 @@ import json
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from io import StringIO
 import gspread
@@ -47,6 +46,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # - Streamlit Cloud: Secrets 에 SPREADSHEET_URL, GOOGLE_CREDENTIALS(JSON 문자열) [, WORKSHEET_NAME]
 # - 로컬(레거시): .streamlit/secrets.toml 의 [mock_portfolio_gsheets] 테이블
 _MOCK_PF_COLS = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
+# 모바일 WebView에서 st.fragment 내부 Plotly가 비는 이슈 대응: fragment가 payload만 쌓고, 차트는 탭 본문에서 그림.
+_MOCK_ETF_CHART_PAYLOAD_KEY = "_mock_etf_return_chart_payload"
 _MOCK_GSHEETS_SECRET_SECTION = "mock_portfolio_gsheets"
 _SECRET_SPREADSHEET_URL = "SPREADSHEET_URL"
 _SECRET_GOOGLE_CREDENTIALS = "GOOGLE_CREDENTIALS"
@@ -292,6 +293,10 @@ def _invalidate_mock_price_caches() -> None:
     """모바일·PC 간 시세가 다르게 보일 때 함께 비울 캐시."""
     try:
         _fetch_current_price.clear()
+    except Exception:
+        pass
+    try:
+        _fetch_close_series_range.clear()
     except Exception:
         pass
 
@@ -1602,6 +1607,161 @@ def _fetch_current_price(ticker: str, _end_date: str = "") -> float | None:
     return None
 
 
+@st.cache_data(ttl=1800)
+def _fetch_close_series_range(ticker: str, start_ymd: str, end_ymd: str) -> pd.Series:
+    """
+    start_ymd~end_ymd(YYYYMMDD) 거래일별 종가 시리즈.
+    pykrx 우선, 실패 시 FinanceDataReader. 인덱스는 날짜(시각 제거) 기준 정렬.
+    """
+    t6 = str(ticker).zfill(6)
+    start_ymd = str(start_ymd).zfill(8)[:8]
+    end_ymd = str(end_ymd).zfill(8)[:8]
+    if len(start_ymd) < 8 or len(end_ymd) < 8:
+        return pd.Series(dtype=float)
+    s_fdr = _to_ymd(start_ymd)
+    e_fdr = _to_ymd(end_ymd)
+    ser = pd.Series(dtype=float)
+    if PYKRX_AVAILABLE:
+        try:
+            ohlc = pykrx_stock.get_market_ohlcv_by_date(start_ymd, end_ymd, t6)
+            if ohlc is not None and not ohlc.empty and "종가" in ohlc.columns:
+                raw_i = ohlc.index
+                idx = pd.to_datetime(raw_i, errors="coerce")
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_localize(None)
+                idx = idx.normalize()
+                ser = pd.Series(ohlc["종가"].astype(float).values, index=idx)
+                ser = ser[~pd.isna(ser.index)].sort_index()
+        except Exception:
+            ser = pd.Series(dtype=float)
+    if ser.empty:
+        try:
+            df = fdr.DataReader(t6, s_fdr, e_fdr)
+            if df is not None and not df.empty and "Close" in df.columns:
+                ix = pd.to_datetime(df.index, errors="coerce")
+                if getattr(ix, "tz", None) is not None:
+                    ix = ix.tz_localize(None)
+                ix = ix.normalize()
+                ser = pd.Series(df["Close"].astype(float).values, index=ix)
+                ser = ser[~pd.isna(ser.index)].sort_index()
+        except Exception:
+            pass
+    ser = ser[~ser.index.duplicated(keep="last")]
+    return ser.astype(float)
+
+
+def _build_etf_daily_return_pct_series(code6: str, lots: pd.DataFrame, end_ymd: str) -> pd.Series | None:
+    """
+    최초 매수일(유효 분 중 가장 이른 날) 이후 각 거래일 종가 기준 수익률(%).
+    분할매수: 해당일까지 매수 완료된 분의 (수량×종가) 합 / 누적 투입금 - 1.
+    """
+    if lots is None or lots.empty:
+        return None
+    parsed: list[tuple[pd.Timestamp, float, int]] = []
+    for _, row in lots.iterrows():
+        dt = pd.to_datetime(row.get("매수일자"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        if getattr(dt, "tz", None) is not None:
+            dt = dt.tz_localize(None)
+        dt = dt.normalize()
+        px = float(pd.to_numeric(row.get("매수단가"), errors="coerce") or 0)
+        q = int(pd.to_numeric(row.get("매수수량"), errors="coerce") or 0)
+        if px <= 0 or q <= 0:
+            continue
+        parsed.append((dt, px, q))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    start_ymd = parsed[0][0].strftime("%Y%m%d")
+    closes = _fetch_close_series_range(code6, start_ymd, end_ymd)
+    if closes is None or closes.empty:
+        return None
+    lots_sorted = sorted(parsed, key=lambda x: x[0])
+    li = 0
+    cum_shares = 0
+    cum_cost = 0.0
+    out_idx: list[pd.Timestamp] = []
+    out_vals: list[float] = []
+    for ts in closes.index.sort_values():
+        while li < len(lots_sorted) and lots_sorted[li][0] <= ts:
+            _d, px, q = lots_sorted[li]
+            cum_shares += q
+            cum_cost += px * q
+            li += 1
+        if cum_shares <= 0 or cum_cost <= 0:
+            continue
+        try:
+            c = float(closes.loc[ts])
+        except Exception:
+            continue
+        if pd.isna(c) or c <= 0:
+            continue
+        ret = (cum_shares * c / cum_cost - 1.0) * 100.0
+        out_idx.append(ts)
+        out_vals.append(ret)
+    if not out_vals:
+        return None
+    return pd.Series(out_vals, index=pd.DatetimeIndex(out_idx), name="수익률(%)")
+
+
+def _render_etf_return_chart_outside_fragment() -> None:
+    """
+    ETF 일별 수익률 Plotly 차트. st.fragment 밖에서 호출해야 모바일 브라우저에서도 안정적으로 표시되는 경우가 많습니다.
+    (fragment 내부에 두면 일부 WebView에서 iframe 높이 0·미마운트 현상이 납니다.)
+    """
+    payload = st.session_state.get(_MOCK_ETF_CHART_PAYLOAD_KEY)
+    if not payload or not isinstance(payload, dict):
+        return
+    seen_order = payload.get("seen_order") or []
+    _sum_df = payload.get("sum_df")
+    _end_ymd_ch = str(payload.get("end_ymd") or _get_end_date())
+    if _sum_df is None or not isinstance(_sum_df, pd.DataFrame) or _sum_df.empty or not seen_order:
+        return
+    fig_etf_ret = go.Figure()
+    chart_fail: list[str] = []
+    for (code6, name) in seen_order:
+        g_lots = _sum_df[_sum_df["_code6"] == code6][["매수일자", "매수단가", "매수수량"]]
+        ser_ret = _build_etf_daily_return_pct_series(code6, g_lots, _end_ymd_ch)
+        time.sleep(0.2)
+        if ser_ret is None or ser_ret.empty:
+            chart_fail.append(f"{code6} ({name})" if (name or "").strip() else code6)
+            continue
+        label = f"{code6} {name}".strip()
+        if len(label) > 82:
+            label = label[:79] + "…"
+        fig_etf_ret.add_trace(go.Scatter(x=ser_ret.index, y=ser_ret.values, mode="lines", name=label))
+    if len(fig_etf_ret.data) > 0:
+        fig_etf_ret.update_layout(
+            title="ETF 일별 수익률 (종가, 분할매수 반영)",
+            xaxis_title="날짜",
+            yaxis_title="수익률 (%)",
+            height=420,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="top", y=-0.28, xanchor="center", x=0.5),
+            margin=dict(b=100),
+        )
+        fig_etf_ret.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
+        st.subheader("📉 ETF 일별 수익률 (종가)")
+        st.caption(
+            "가장 이른 매수일 이후, **그날까지 매수가 완료된 분**의 누적 투입금 대비 "
+            "당일 종가로 산출한 보유 평가금의 수익률(%)입니다."
+        )
+        st.plotly_chart(
+            fig_etf_ret,
+            use_container_width=True,
+            theme=None,
+            config={"scrollZoom": False, "displayModeBar": True},
+        )
+    if chart_fail:
+        tail = " …" if len(chart_fail) > 5 else ""
+        st.warning(
+            "일부 ETF는 시세 이력을 불러오지 못해 차트에서 제외했습니다: "
+            + ", ".join(chart_fail[:5])
+            + tail
+        )
+
+
 def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
     """CSV 내역 + 실시간 현재가 → 평가금액, 수익금, 수익률(%), 매매 시그널 컬럼 추가."""
     if raw_df is None or raw_df.empty:
@@ -1614,26 +1774,14 @@ def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
     end_date = _get_end_date()
     unique_codes = out["종목코드"].astype(str).str.zfill(6).unique().tolist()
     price_map: dict[str, float] = {}
-
-    def _fetch_one(code: str) -> tuple[str, float]:
-        p = _fetch_current_price(code, _end_date=end_date)
-        return code, float(p) if p is not None else 0.0
-
-    n = len(unique_codes)
-    workers = min(6, max(1, n))
-    if n <= 1:
-        for c in unique_codes:
-            code, px = _fetch_one(c)
-            price_map[code] = px
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_fetch_one, c) for c in unique_codes]
-            for fut in as_completed(futs):
-                try:
-                    code, px = fut.result()
-                    price_map[code] = px
-                except Exception:
-                    pass
+    # ThreadPoolExecutor + st.cache_data 조합은 워커 스레드에 ScriptRunContext가 없어
+    # "missing ScriptRunContext!" 경고·캐시 비정상을 유발하므로, 시세는 메인 스레드에서 순차 조회.
+    for c in unique_codes:
+        try:
+            p = _fetch_current_price(c, _end_date=end_date)
+            price_map[c] = float(p) if p is not None else 0.0
+        except Exception:
+            price_map[c] = 0.0
     out["현재가"] = out["종목코드"].astype(str).str.zfill(6).map(lambda c: price_map.get(c, 0))
     out["평가금액"] = out["현재가"] * out["매수수량"]
     out["수익금"] = (out["현재가"] - out["매수단가"]) * out["매수수량"]
@@ -1665,14 +1813,15 @@ def _render_mock_portfolio_inner() -> None:
     if pf.empty:
         st.warning("평가 데이터를 불러올 수 없습니다.")
         return
+    st.session_state.pop(_MOCK_ETF_CHART_PAYLOAD_KEY, None)
     etf_codes = _get_etf_codes()
     pf["_code6"] = pf["종목코드"].astype(str).str.zfill(6)
     pf_stocks = pf[~pf["_code6"].isin(etf_codes)].drop(columns=["_code6"]).reset_index(drop=True)
     pf_etfs = pf[pf["_code6"].isin(etf_codes)].drop(columns=["_code6"]).reset_index(drop=True)
     if not pf_stocks.empty:
-        pf_stocks["매수단가"] = pf_stocks["매수단가"].astype(float)
+        pf_stocks["매수단가"] = pd.to_numeric(pf_stocks["매수단가"], errors="coerce").fillna(0).astype("float64")
     if not pf_etfs.empty:
-        pf_etfs["매수단가"] = pf_etfs["매수단가"].astype(float)
+        pf_etfs["매수단가"] = pd.to_numeric(pf_etfs["매수단가"], errors="coerce").fillna(0).astype("float64")
 
     save_cols = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
     # 종목코드·종목명은 동적 행 추가(num_rows=dynamic) 시 비어 있으므로 반드시 편집 가능해야 함
@@ -1680,8 +1829,14 @@ def _render_mock_portfolio_inner() -> None:
         "매수일자": st.column_config.TextColumn("매수일자", disabled=False, help="YYYY-MM-DD 형식으로 수정 가능"),
         "종목코드": st.column_config.TextColumn("종목코드", disabled=False, help="6자리 숫자. 행 추가 시 필수"),
         "종목명": st.column_config.TextColumn("종목명", disabled=False, help="행 추가 시 필수"),
-        "매수단가": st.column_config.NumberColumn("매수단가", format="%,.2f", help="직접 수정 가능 (소수점 입력 가능)"),
-        "매수수량": st.column_config.NumberColumn("매수수량", format="%d", help="직접 수정 가능"),
+        "매수단가": st.column_config.NumberColumn(
+            "매수단가",
+            format="%,.2f",
+            min_value=0.0,
+            step=0.01,
+            help="소수 둘째 자리까지 (모바일은 step·실수 타입 필요)",
+        ),
+        "매수수량": st.column_config.NumberColumn("매수수량", format="%d", step=1, help="직접 수정 가능"),
         "현재가": st.column_config.NumberColumn("현재가", format="%,d", disabled=True),
         "평가금액": st.column_config.NumberColumn("평가금액", format="%,d", disabled=True),
         "수익금": st.column_config.NumberColumn("수익금", format="%,d", disabled=True),
@@ -1730,7 +1885,8 @@ def _render_mock_portfolio_inner() -> None:
         )
 
     st.subheader("📊 ETF")
-    etf_editor_df = pf_etfs.copy() if not pf_etfs.empty else pd.DataFrame(columns=list(pf.columns))
+    # 빈 표를 columns=만으로 만들면 매수단가가 object/int로 잡혀 data_editor가 소수 입력을 막는 경우가 있음(모바일 특히)
+    etf_editor_df = pf_etfs.copy() if not pf_etfs.empty else pf.iloc[0:0].copy()
     _n_etf = len(etf_editor_df)
     edited_etfs = st.data_editor(
         etf_editor_df,
@@ -1776,6 +1932,12 @@ def _render_mock_portfolio_inner() -> None:
                 rows.append(f"| **ETF 전체** | **{int(tot_cost):,}** | **{int(tot_eval):,}** | **{tot_diff:+,}** | **{tot_ret:+.2f}%** |")
                 tbl = "구분 | 총매수금액 | 총평가금액 | 차액 | 종합 수익률(%)\n" + "--- | --- | --- | --- | ---\n" + "\n".join(rows)
                 st.markdown(tbl)
+                stash = _sum_df[["매수일자", "매수단가", "매수수량", "_code6", "종목명"]].copy()
+                st.session_state[_MOCK_ETF_CHART_PAYLOAD_KEY] = {
+                    "seen_order": list(seen_order),
+                    "sum_df": stash,
+                    "end_ymd": _get_end_date(),
+                }
 
     parts = []
     if edited_stocks is not None and not edited_stocks.empty:
@@ -1831,16 +1993,38 @@ def _render_mock_portfolio_inner() -> None:
     else:
         pf_etfs_m = pf_etfs
 
-    total_qty = int(pf["매수수량"].sum())
-    total_cost = (pf["매수단가"] * pf["매수수량"]).sum()
-    total_eval = pf["평가금액"].sum()
+    # 합계는 화면 표(편집 반영)와 동일: Σ(매수단가×수량), 평가는 Σ(현재가×수량). 엑셀 SUMPRODUCT와 같음.
+    _m_parts = [d for d in (pf_stocks_m, pf_etfs_m) if d is not None and not d.empty]
+    if _m_parts:
+        _mall = pd.concat(_m_parts, ignore_index=True)
+        _q = pd.to_numeric(_mall["매수수량"], errors="coerce").fillna(0)
+        _px = pd.to_numeric(_mall["매수단가"], errors="coerce").fillna(0)
+        total_qty = int(_q.sum())
+        total_cost = float((_px * _q).sum())
+        if "현재가" in _mall.columns:
+            _cp = pd.to_numeric(_mall["현재가"], errors="coerce").fillna(0)
+            total_eval = float((_cp * _q).sum())
+        else:
+            total_eval = float(pd.to_numeric(_mall["평가금액"], errors="coerce").fillna(0).sum())
+    else:
+        total_qty = int(pd.to_numeric(pf["매수수량"], errors="coerce").fillna(0).sum())
+        _q0 = pd.to_numeric(pf["매수수량"], errors="coerce").fillna(0)
+        _p0 = pd.to_numeric(pf["매수단가"], errors="coerce").fillna(0)
+        total_cost = float((_p0 * _q0).sum())
+        total_eval = float(pf["평가금액"].sum())
     total_return_pct = (total_eval - total_cost) / total_cost * 100 if total_cost > 0 else 0
 
     def _calc_return(df_sub: pd.DataFrame) -> tuple[float, float, float]:
         if df_sub.empty:
             return 0.0, 0.0, 0.0
-        cost = (df_sub["매수단가"] * df_sub["매수수량"]).sum()
-        eval_amt = df_sub["평가금액"].sum()
+        q = pd.to_numeric(df_sub["매수수량"], errors="coerce").fillna(0)
+        px = pd.to_numeric(df_sub["매수단가"], errors="coerce").fillna(0)
+        cost = float((px * q).sum())
+        if "현재가" in df_sub.columns:
+            cp = pd.to_numeric(df_sub["현재가"], errors="coerce").fillna(0)
+            eval_amt = float((cp * q).sum())
+        else:
+            eval_amt = float(pd.to_numeric(df_sub["평가금액"], errors="coerce").fillna(0).sum())
         ret = (eval_amt - cost) / cost * 100 if cost > 0 else 0
         return cost, eval_amt, ret
 
@@ -1848,13 +2032,16 @@ def _render_mock_portfolio_inner() -> None:
     etf_cost, etf_eval, etf_return = _calc_return(pf_etfs_m)
 
     st.divider()
+    st.caption(
+        "총 매수금액 = 각 행 **매수단가×매수수량**의 합입니다. 엑셀·구글시트에서는 `SUMPRODUCT(단가열, 수량열)`과 동일합니다."
+    )
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.metric("합계 수량", f"{total_qty:,}주")
     with c2:
-        st.metric("총 매수금액", f"{total_cost:,.0f}원")
+        st.metric("총 매수금액", f"{total_cost:,.2f}원")
     with c3:
-        st.metric("총 평가금액", f"{total_eval:,.0f}원")
+        st.metric("총 평가금액", f"{total_eval:,.2f}원")
     with c4:
         st.metric("전체 수익률", f"{total_return_pct:+.2f}%")
     with c5:
@@ -2239,3 +2426,4 @@ with tab2:
     else:
         _pf_run_every = float(_mock_refresh_sec) if _mock_auto_price else None
         st.fragment(run_every=_pf_run_every)(_render_mock_portfolio_inner)()
+        _render_etf_return_chart_outside_fragment()
