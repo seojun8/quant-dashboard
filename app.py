@@ -1733,7 +1733,7 @@ def _build_portfolio_total_daily_return_pct_series(lots: pd.DataFrame, end_ymd: 
 def _render_portfolio_return_chart_outside_fragment() -> None:
     """
     포트폴리오 전체 일별 수익률(단일 선). st.fragment 밖에서 렌더.
-    모바일: use_container_width + 고정 높이, Y축 눈자 제한, X축 날짜만(YY-MM-DD), 범례 하단.
+    모바일: use_container_width·height=450, scrollZoom 끔, X는 %y-%m-%d·일 단위, Y는 autorange.
     """
     payload = st.session_state.get(_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY)
     if not payload or not isinstance(payload, dict):
@@ -1747,11 +1747,23 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
         st.subheader("📉 포트폴리오 전체 수익률 (종가)")
         st.info("차트를 그리기 위한 시세 이력을 불러오지 못했습니다. 잠시 후 **다시 불러오기**를 눌러 보세요.")
         return
+    # X축: 시각(초) 제거·일 단위로 정규화해 동일 날짜 중복·겹침 완화
+    _xi = pd.to_datetime(ser_ret.index, errors="coerce")
+    if getattr(_xi, "tz", None) is not None:
+        _xi = _xi.tz_localize(None)
+    _xi = _xi.normalize()
+    s_plot = pd.Series(ser_ret.values.astype(float), index=_xi)
+    s_plot = s_plot[~pd.isna(s_plot.index)].sort_index()
+    s_plot = s_plot[~s_plot.index.duplicated(keep="last")]
+    if s_plot.empty:
+        st.subheader("📉 포트폴리오 전체 수익률 (종가)")
+        st.info("차트를 그릴 유효한 날짜 데이터가 없습니다.")
+        return
     fig = go.Figure(
         data=[
             go.Scatter(
-                x=ser_ret.index,
-                y=ser_ret.values.astype(float),
+                x=s_plot.index,
+                y=s_plot.values.astype(float),
                 mode="lines",
                 name="전체 수익률",
                 line=dict(width=2, color="#2563eb"),
@@ -1777,16 +1789,17 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
         ),
         margin=dict(l=36, r=12, t=40, b=88),
     )
+    # tickformat만 지정하고 nticks는 두지 않아 Plotly가 간격 자동 배치 (모바일 겹침 완화)
     fig.update_xaxes(
         type="date",
         tickformat="%y-%m-%d",
-        nticks=10,
-        tickangle=-35,
         automargin=True,
         showgrid=True,
+        tickangle=-40,
     )
     fig.update_yaxes(
-        nticks=6,
+        autorange=True,
+        fixedrange=False,
         tickformat=".2f",
         automargin=True,
         zeroline=True,
@@ -1802,8 +1815,13 @@ def _render_portfolio_return_chart_outside_fragment() -> None:
     st.plotly_chart(
         fig,
         use_container_width=True,
+        height=450,
         theme=None,
-        config={"scrollZoom": False, "displayModeBar": True},
+        config={
+            "scrollZoom": False,
+            "doubleClick": False,
+            "displayModeBar": True,
+        },
     )
 
 
