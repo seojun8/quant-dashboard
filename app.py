@@ -23,6 +23,7 @@ import gspread
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit.errors import StreamlitSecretNotFoundError
 
 # pykrx: 수급/시총 | FinanceDataReader: 장기 가격 | 네이버: 재무제표
@@ -47,7 +48,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # - 로컬(레거시): .streamlit/secrets.toml 의 [mock_portfolio_gsheets] 테이블
 _MOCK_PF_COLS = ["매수일자", "종목코드", "종목명", "매수단가", "매수수량"]
 # 모바일 WebView에서 st.fragment 내부 Plotly가 비는 이슈 대응: fragment가 payload만 쌓고, 차트는 탭 본문에서 그림.
-_MOCK_ETF_CHART_PAYLOAD_KEY = "_mock_etf_return_chart_payload"
+_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY = "_mock_portfolio_return_chart_payload"
 _MOCK_GSHEETS_SECRET_SECTION = "mock_portfolio_gsheets"
 _SECRET_SPREADSHEET_URL = "SPREADSHEET_URL"
 _SECRET_GOOGLE_CREDENTIALS = "GOOGLE_CREDENTIALS"
@@ -1650,14 +1651,15 @@ def _fetch_close_series_range(ticker: str, start_ymd: str, end_ymd: str) -> pd.S
     return ser.astype(float)
 
 
-def _build_etf_daily_return_pct_series(code6: str, lots: pd.DataFrame, end_ymd: str) -> pd.Series | None:
+def _build_portfolio_total_daily_return_pct_series(lots: pd.DataFrame, end_ymd: str) -> pd.Series | None:
     """
-    최초 매수일(유효 분 중 가장 이른 날) 이후 각 거래일 종가 기준 수익률(%).
-    분할매수: 해당일까지 매수 완료된 분의 (수량×종가) 합 / 누적 투입금 - 1.
+    주식+ETF 전체 보유: 가장 이른 매수일 이후 거래일마다
+    (각 종목 수량×당일 종가의 합) / (그때까지 누적 투입금) - 1 을 %로 반환.
+    분할매수·종목 추가 시 자동 반영(표에 있는 전체 매수 행 기준).
     """
-    if lots is None or lots.empty:
+    if lots is None or lots.empty or "종목코드" not in lots.columns:
         return None
-    parsed: list[tuple[pd.Timestamp, float, int]] = []
+    parsed: list[tuple[pd.Timestamp, str, float, int]] = []
     for _, row in lots.iterrows():
         dt = pd.to_datetime(row.get("매수일자"), errors="coerce")
         if pd.isna(dt):
@@ -1665,101 +1667,122 @@ def _build_etf_daily_return_pct_series(code6: str, lots: pd.DataFrame, end_ymd: 
         if getattr(dt, "tz", None) is not None:
             dt = dt.tz_localize(None)
         dt = dt.normalize()
+        sc = str(row.get("종목코드", "")).strip().replace(".0", "")
+        nc = pd.to_numeric(sc, errors="coerce")
+        if pd.isna(nc):
+            continue
+        t6 = f"{int(nc):06d}"
+        if not t6.isdigit() or len(t6) != 6:
+            continue
         px = float(pd.to_numeric(row.get("매수단가"), errors="coerce") or 0)
         q = int(pd.to_numeric(row.get("매수수량"), errors="coerce") or 0)
         if px <= 0 or q <= 0:
             continue
-        parsed.append((dt, px, q))
+        parsed.append((dt, t6, px, q))
     if not parsed:
         return None
-    parsed.sort(key=lambda x: x[0])
+    parsed.sort(key=lambda x: (x[0], x[1]))
     start_ymd = parsed[0][0].strftime("%Y%m%d")
-    closes = _fetch_close_series_range(code6, start_ymd, end_ymd)
-    if closes is None or closes.empty:
-        return None
-    lots_sorted = sorted(parsed, key=lambda x: x[0])
-    li = 0
-    cum_shares = 0
-    cum_cost = 0.0
+    tickers = sorted({t for _, t, _, _ in parsed})
+    closes_by: dict[str, pd.Series] = {}
+    for t6 in tickers:
+        time.sleep(0.15)
+        ser = _fetch_close_series_range(t6, start_ymd, end_ymd)
+        if ser is None or ser.empty:
+            return None
+        closes_by[t6] = ser.sort_index()
+    common_idx = None
+    for ser in closes_by.values():
+        common_idx = ser.index if common_idx is None else common_idx.union(ser.index)
+    common_idx = pd.DatetimeIndex(common_idx).sort_values().unique()
+    close_m = pd.DataFrame({t: closes_by[t].reindex(common_idx).ffill() for t in tickers})
     out_idx: list[pd.Timestamp] = []
     out_vals: list[float] = []
-    for ts in closes.index.sort_values():
-        while li < len(lots_sorted) and lots_sorted[li][0] <= ts:
-            _d, px, q = lots_sorted[li]
-            cum_shares += q
-            cum_cost += px * q
-            li += 1
-        if cum_shares <= 0 or cum_cost <= 0:
+    for d in common_idx:
+        cs: dict[str, int] = {}
+        cc: dict[str, float] = {}
+        for buy_ts, t6, px, q in parsed:
+            if buy_ts <= d:
+                cs[t6] = cs.get(t6, 0) + q
+                cc[t6] = cc.get(t6, 0.0) + float(px) * q
+        total_inv = sum(cc.values())
+        if total_inv <= 0:
             continue
-        try:
-            c = float(closes.loc[ts])
-        except Exception:
+        mv = 0.0
+        ok = True
+        for t6, sh in cs.items():
+            if sh <= 0:
+                continue
+            pr = close_m.loc[d, t6] if t6 in close_m.columns else float("nan")
+            if pd.isna(pr) or pr <= 0:
+                ok = False
+                break
+            mv += float(sh) * float(pr)
+        if not ok or mv <= 0:
             continue
-        if pd.isna(c) or c <= 0:
-            continue
-        ret = (cum_shares * c / cum_cost - 1.0) * 100.0
-        out_idx.append(ts)
-        out_vals.append(ret)
+        out_idx.append(pd.Timestamp(d))
+        out_vals.append((mv / total_inv - 1.0) * 100.0)
     if not out_vals:
         return None
-    return pd.Series(out_vals, index=pd.DatetimeIndex(out_idx), name="수익률(%)")
+    ser_out = pd.Series(out_vals, index=pd.DatetimeIndex(out_idx), name="전체 수익률(%)")
+    return ser_out[~ser_out.index.duplicated(keep="last")]
 
 
-def _render_etf_return_chart_outside_fragment() -> None:
+def _render_portfolio_return_chart_outside_fragment() -> None:
     """
-    ETF 일별 수익률 Plotly 차트. st.fragment 밖에서 호출해야 모바일 브라우저에서도 안정적으로 표시되는 경우가 많습니다.
-    (fragment 내부에 두면 일부 WebView에서 iframe 높이 0·미마운트 현상이 납니다.)
+    포트폴리오 전체 일별 수익률(단일 선). st.fragment 밖에서 렌더.
+    가로 폭을 길게 잡고 div overflow-x로 모바일에서 좌우 스크롤 가능.
     """
-    payload = st.session_state.get(_MOCK_ETF_CHART_PAYLOAD_KEY)
+    payload = st.session_state.get(_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY)
     if not payload or not isinstance(payload, dict):
         return
-    seen_order = payload.get("seen_order") or []
-    _sum_df = payload.get("sum_df")
+    lots_df = payload.get("lots_df")
     _end_ymd_ch = str(payload.get("end_ymd") or _get_end_date())
-    if _sum_df is None or not isinstance(_sum_df, pd.DataFrame) or _sum_df.empty or not seen_order:
+    if lots_df is None or not isinstance(lots_df, pd.DataFrame) or lots_df.empty:
         return
-    fig_etf_ret = go.Figure()
-    chart_fail: list[str] = []
-    for (code6, name) in seen_order:
-        g_lots = _sum_df[_sum_df["_code6"] == code6][["매수일자", "매수단가", "매수수량"]]
-        ser_ret = _build_etf_daily_return_pct_series(code6, g_lots, _end_ymd_ch)
-        time.sleep(0.2)
-        if ser_ret is None or ser_ret.empty:
-            chart_fail.append(f"{code6} ({name})" if (name or "").strip() else code6)
-            continue
-        label = f"{code6} {name}".strip()
-        if len(label) > 82:
-            label = label[:79] + "…"
-        fig_etf_ret.add_trace(go.Scatter(x=ser_ret.index, y=ser_ret.values, mode="lines", name=label))
-    if len(fig_etf_ret.data) > 0:
-        fig_etf_ret.update_layout(
-            title="ETF 일별 수익률 (종가, 분할매수 반영)",
-            xaxis_title="날짜",
-            yaxis_title="수익률 (%)",
-            height=420,
-            template="plotly_white",
-            legend=dict(orientation="h", yanchor="top", y=-0.28, xanchor="center", x=0.5),
-            margin=dict(b=100),
-        )
-        fig_etf_ret.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
-        st.subheader("📉 ETF 일별 수익률 (종가)")
-        st.caption(
-            "가장 이른 매수일 이후, **그날까지 매수가 완료된 분**의 누적 투입금 대비 "
-            "당일 종가로 산출한 보유 평가금의 수익률(%)입니다."
-        )
-        st.plotly_chart(
-            fig_etf_ret,
-            use_container_width=True,
-            theme=None,
-            config={"scrollZoom": False, "displayModeBar": True},
-        )
-    if chart_fail:
-        tail = " …" if len(chart_fail) > 5 else ""
-        st.warning(
-            "일부 ETF는 시세 이력을 불러오지 못해 차트에서 제외했습니다: "
-            + ", ".join(chart_fail[:5])
-            + tail
-        )
+    ser_ret = _build_portfolio_total_daily_return_pct_series(lots_df, _end_ymd_ch)
+    if ser_ret is None or ser_ret.empty:
+        st.subheader("📉 포트폴리오 전체 수익률 (종가)")
+        st.info("차트를 그리기 위한 시세 이력을 불러오지 못했습니다. 잠시 후 **다시 불러오기**를 눌러 보세요.")
+        return
+    n = len(ser_ret)
+    plot_w = int(max(1100, min(9000, n * 12)))
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=ser_ret.index,
+                y=ser_ret.values.astype(float),
+                mode="lines",
+                name="전체",
+                line=dict(width=2, color="#2563eb"),
+                hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}%<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="포트폴리오 전체 일별 수익률 (종가·분할매수 반영)",
+        xaxis_title="날짜",
+        yaxis_title="수익률 (%)",
+        height=400,
+        width=plot_w,
+        template="plotly_white",
+        showlegend=False,
+        margin=dict(l=56, r=24, t=56, b=48),
+        yaxis=dict(tickformat=".2f", zeroline=True, zerolinewidth=1, zerolinecolor="#bbb"),
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
+    cfg = {"scrollZoom": False, "displayModeBar": True, "responsive": False}
+    inner = fig.to_html(full_html=False, include_plotlyjs="cdn", config=cfg)
+    wrapped = (
+        "<div style=\"width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:8px;\">"
+        f"<div style=\"min-width:{plot_w}px;\">{inner}</div></div>"
+    )
+    st.subheader("📉 포트폴리오 전체 수익률 (종가)")
+    st.caption(
+        "표에 있는 **주식·ETF 전체 매수 행**을 합산합니다. 각 거래일마다 종목별 종가×보유수량의 합을 "
+        "그날까지의 누적 매수금액으로 나눈 뒤 수익률(%)로 표시합니다. 가로로 밀어 스크롤해 보세요."
+    )
+    components.html(wrapped, height=460, scrolling=True)
 
 
 def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -1813,7 +1836,7 @@ def _render_mock_portfolio_inner() -> None:
     if pf.empty:
         st.warning("평가 데이터를 불러올 수 없습니다.")
         return
-    st.session_state.pop(_MOCK_ETF_CHART_PAYLOAD_KEY, None)
+    st.session_state.pop(_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY, None)
     etf_codes = _get_etf_codes()
     pf["_code6"] = pf["종목코드"].astype(str).str.zfill(6)
     pf_stocks = pf[~pf["_code6"].isin(etf_codes)].drop(columns=["_code6"]).reset_index(drop=True)
@@ -1932,12 +1955,6 @@ def _render_mock_portfolio_inner() -> None:
                 rows.append(f"| **ETF 전체** | **{int(tot_cost):,}** | **{int(tot_eval):,}** | **{tot_diff:+,}** | **{tot_ret:+.2f}%** |")
                 tbl = "구분 | 총매수금액 | 총평가금액 | 차액 | 종합 수익률(%)\n" + "--- | --- | --- | --- | ---\n" + "\n".join(rows)
                 st.markdown(tbl)
-                stash = _sum_df[["매수일자", "매수단가", "매수수량", "_code6", "종목명"]].copy()
-                st.session_state[_MOCK_ETF_CHART_PAYLOAD_KEY] = {
-                    "seen_order": list(seen_order),
-                    "sum_df": stash,
-                    "end_ymd": _get_end_date(),
-                }
 
     parts = []
     if edited_stocks is not None and not edited_stocks.empty:
@@ -1997,6 +2014,11 @@ def _render_mock_portfolio_inner() -> None:
     _m_parts = [d for d in (pf_stocks_m, pf_etfs_m) if d is not None and not d.empty]
     if _m_parts:
         _mall = pd.concat(_m_parts, ignore_index=True)
+        _chart_lots = _mall[["매수일자", "종목코드", "매수단가", "매수수량"]].copy()
+        st.session_state[_MOCK_PORTFOLIO_CHART_PAYLOAD_KEY] = {
+            "lots_df": _chart_lots,
+            "end_ymd": _get_end_date(),
+        }
         _q = pd.to_numeric(_mall["매수수량"], errors="coerce").fillna(0)
         _px = pd.to_numeric(_mall["매수단가"], errors="coerce").fillna(0)
         total_qty = int(_q.sum())
@@ -2426,4 +2448,4 @@ with tab2:
     else:
         _pf_run_every = float(_mock_refresh_sec) if _mock_auto_price else None
         st.fragment(run_every=_pf_run_every)(_render_mock_portfolio_inner)()
-        _render_etf_return_chart_outside_fragment()
+        _render_portfolio_return_chart_outside_fragment()
