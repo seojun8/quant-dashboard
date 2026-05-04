@@ -1499,6 +1499,32 @@ def _fill_missing_ticker_names(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
 
 _MOCK_STOCKS_EDITOR_PREFILL = "mock_stocks_editor_prefill_df"
 _MOCK_ETFS_EDITOR_PREFILL = "mock_etfs_editor_prefill_df"
+# fragment(run_every) 재실행 시 시트만 읽으면 미저장 행이 사라지므로, 저장 전 매수 5컬럼 원본을 유지
+_MOCK_PORTFOLIO_DRAFT_RAW_KEY = "mock_portfolio_draft_raw_df"
+
+
+def _invalidate_mock_portfolio_draft() -> None:
+    try:
+        if _MOCK_PORTFOLIO_DRAFT_RAW_KEY in st.session_state:
+            del st.session_state[_MOCK_PORTFOLIO_DRAFT_RAW_KEY]
+    except Exception:
+        pass
+
+
+def _split_mock_pf_stock_etf(raw_df: pd.DataFrame, etf_codes: frozenset) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """종목코드 기준 주식·ETF 매수 행 분리 (모의 포트폴리오 5컬럼)."""
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=_MOCK_PF_COLS), pd.DataFrame(columns=_MOCK_PF_COLS)
+    d = raw_df.copy()
+    for c in _MOCK_PF_COLS:
+        if c not in d.columns:
+            d[c] = None
+    d = d[_MOCK_PF_COLS].copy()
+    d = _coerce_mock_sheet_numeric_columns(d)
+    d["_c6"] = d["종목코드"].astype(str).str.zfill(6)
+    st_part = d[~d["_c6"].isin(etf_codes)].drop(columns=["_c6"], errors="ignore").reset_index(drop=True)
+    et_part = d[d["_c6"].isin(etf_codes)].drop(columns=["_c6"], errors="ignore").reset_index(drop=True)
+    return st_part, et_part
 
 
 def _strip_data_editor_state(editor_key: str) -> None:
@@ -1658,8 +1684,8 @@ def _save_mock_portfolio(df: pd.DataFrame, *, allow_clear_sheet: bool = False) -
                 str(r["매수일자"]).strip(),
                 str(r["종목코드"]).strip().zfill(6),
                 str(r["종목명"]).strip(),
-                float(pd.to_numeric(pa, errors="coerce") or 0),
-                int(pd.to_numeric(qt, errors="coerce") or 0),
+                _num_to_float(pa, 0.0),
+                _num_to_nonneg_int(qt, 0),
             ])
     try:
         ws.clear()
@@ -1740,6 +1766,17 @@ def _fetch_close_series_range(ticker: str, start_ymd: str, end_ymd: str) -> pd.S
     return ser.astype(float)
 
 
+def _num_to_float(v, default: float = 0.0) -> float:
+    """pd.to_numeric NaN은 `or 0`으로 제거되지 않음(float NaN은 truthy)."""
+    x = pd.to_numeric(v, errors="coerce")
+    return default if pd.isna(x) else float(x)
+
+
+def _num_to_nonneg_int(v, default: int = 0) -> int:
+    x = pd.to_numeric(v, errors="coerce")
+    return default if pd.isna(x) else int(x)
+
+
 def _build_portfolio_total_daily_return_pct_series(lots: pd.DataFrame, end_ymd: str) -> pd.Series | None:
     """
     주식+ETF 전체 보유: 가장 이른 매수일 이후 거래일마다
@@ -1763,8 +1800,8 @@ def _build_portfolio_total_daily_return_pct_series(lots: pd.DataFrame, end_ymd: 
         t6 = f"{int(nc):06d}"
         if not t6.isdigit() or len(t6) != 6:
             continue
-        px = float(pd.to_numeric(row.get("매수단가"), errors="coerce") or 0)
-        q = int(pd.to_numeric(row.get("매수수량"), errors="coerce") or 0)
+        px = _num_to_float(row.get("매수단가"), 0.0)
+        q = _num_to_nonneg_int(row.get("매수수량"), 0)
         if px <= 0 or q <= 0:
             continue
         parsed.append((dt, t6, px, q))
@@ -1954,13 +1991,30 @@ def _build_portfolio_with_prices(raw_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _rebuild_mock_editor_df(df: pd.DataFrame, save_cols: list[str]) -> pd.DataFrame:
+    """
+    st.data_editor는 비활성 열(현재가·평가·수익률)을 이전 스냅샷으로 남겨 두는 경우가 있어,
+    편집된 매수 5컬럼을 기준으로 다시 시세·손익을 맞춘다. (수량·단가 입력 직후 0으로 보이는 현상 완화)
+    """
+    if df is None or df.empty:
+        return df
+    if not all(c in df.columns for c in save_cols):
+        return df
+    return _build_portfolio_with_prices(_coerce_mock_sheet_numeric_columns(df[save_cols].copy()))
+
+
 def _render_mock_portfolio_inner() -> None:
     """모의 보유 표·가격·손익 지표. st.fragment(run_every=…)와 같이 쓰면 주기 갱신 시 이 함수만 재실행되어 전체 앱(1탭 분석 등)은 다시 돌지 않습니다."""
     raw_inner = _load_mock_portfolio()
     if raw_inner.empty:
         st.warning("보유 종목이 없습니다. 새로고침하거나 모의 매수를 추가해 주세요.")
         return
-    pf = _build_portfolio_with_prices(raw_inner)
+    draft_sf = st.session_state.get(_MOCK_PORTFOLIO_DRAFT_RAW_KEY)
+    if isinstance(draft_sf, pd.DataFrame) and not draft_sf.empty and all(c in draft_sf.columns for c in _MOCK_PF_COLS):
+        raw_for_pf = _coerce_mock_sheet_numeric_columns(draft_sf[_MOCK_PF_COLS].copy())
+    else:
+        raw_for_pf = raw_inner
+    pf = _build_portfolio_with_prices(raw_for_pf)
     if pf.empty:
         st.warning("평가 데이터를 불러올 수 없습니다.")
         return
@@ -1987,7 +2041,13 @@ def _render_mock_portfolio_inner() -> None:
             step=0.01,
             help="소수 둘째 자리까지 (모바일은 step·실수 타입 필요)",
         ),
-        "매수수량": st.column_config.NumberColumn("매수수량", format="%d", step=1, help="직접 수정 가능"),
+        "매수수량": st.column_config.NumberColumn(
+            "매수수량",
+            format="%.0f",
+            step=1.0,
+            min_value=0.0,
+            help="주(정수) 수량. `%%d` 포맷은 일부 환경에서 값이 0으로 고정되는 이슈가 있어 실수·반올림으로 처리합니다.",
+        ),
         "현재가": st.column_config.NumberColumn("현재가", format="%,d", disabled=True),
         "평가금액": st.column_config.NumberColumn("평가금액", format="%,d", disabled=True),
         "수익금": st.column_config.NumberColumn("수익금", format="%,d", disabled=True),
@@ -2041,7 +2101,24 @@ def _render_mock_portfolio_inner() -> None:
             key="mock_stocks_editor",
         )
         edited_stocks, _stock_names_filled = _fill_missing_ticker_names(edited_stocks)
+        if edited_stocks is not None and not edited_stocks.empty:
+            edited_stocks = _rebuild_mock_editor_df(edited_stocks, save_cols)
         if _stock_names_filled:
+            _parts_sf: list[pd.DataFrame] = []
+            if all(c in edited_stocks.columns for c in save_cols):
+                _parts_sf.append(edited_stocks[save_cols].copy())
+            _dr0 = st.session_state.get(_MOCK_PORTFOLIO_DRAFT_RAW_KEY)
+            _etf_keep = pd.DataFrame(columns=_MOCK_PF_COLS)
+            if isinstance(_dr0, pd.DataFrame) and not _dr0.empty and all(c in _dr0.columns for c in _MOCK_PF_COLS):
+                _, _etf_keep = _split_mock_pf_stock_etf(_dr0, etf_codes)
+            if _etf_keep.empty:
+                _, _etf_keep = _split_mock_pf_stock_etf(raw_inner, etf_codes)
+            if not _etf_keep.empty:
+                _parts_sf.append(_etf_keep[save_cols].copy())
+            if _parts_sf:
+                st.session_state[_MOCK_PORTFOLIO_DRAFT_RAW_KEY] = _coerce_mock_sheet_numeric_columns(
+                    pd.concat(_parts_sf, ignore_index=True)
+                )
             st.session_state[_MOCK_STOCKS_EDITOR_PREFILL] = edited_stocks
             st.rerun()
 
@@ -2065,9 +2142,33 @@ def _render_mock_portfolio_inner() -> None:
         key="mock_etfs_editor",
     )
     edited_etfs, _etf_names_filled = _fill_missing_ticker_names(edited_etfs)
+    if edited_etfs is not None and not edited_etfs.empty:
+        edited_etfs = _rebuild_mock_editor_df(edited_etfs, save_cols)
     if _etf_names_filled:
+        _draft_parts_nm: list[pd.DataFrame] = []
+        if edited_stocks is not None and not edited_stocks.empty and all(c in edited_stocks.columns for c in save_cols):
+            _draft_parts_nm.append(edited_stocks[save_cols].copy())
+        if all(c in edited_etfs.columns for c in save_cols):
+            _draft_parts_nm.append(edited_etfs[save_cols].copy())
+        if _draft_parts_nm:
+            st.session_state[_MOCK_PORTFOLIO_DRAFT_RAW_KEY] = _coerce_mock_sheet_numeric_columns(
+                pd.concat(_draft_parts_nm, ignore_index=True)
+            )
         st.session_state[_MOCK_ETFS_EDITOR_PREFILL] = edited_etfs
         st.rerun()
+
+    _draft_parts: list[pd.DataFrame] = []
+    if edited_stocks is not None and not edited_stocks.empty and all(c in edited_stocks.columns for c in save_cols):
+        _draft_parts.append(edited_stocks[save_cols].copy())
+    if edited_etfs is not None and not edited_etfs.empty and all(c in edited_etfs.columns for c in save_cols):
+        _draft_parts.append(edited_etfs[save_cols].copy())
+    if _draft_parts:
+        st.session_state[_MOCK_PORTFOLIO_DRAFT_RAW_KEY] = _coerce_mock_sheet_numeric_columns(
+            pd.concat(_draft_parts, ignore_index=True)
+        )
+    else:
+        _invalidate_mock_portfolio_draft()
+
     st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 **종목코드**(6자리)만 넣어도 종목명이 자동 입력됩니다. 일자·단가·수량을 입력하세요.")
     _etf_for_summary = edited_etfs if edited_etfs is not None and not edited_etfs.empty else pf_etfs
     if _etf_for_summary is not None and not _etf_for_summary.empty:
@@ -2136,6 +2237,7 @@ def _render_mock_portfolio_inner() -> None:
         except RuntimeError as e:
             st.error(str(e))
         else:
+            _invalidate_mock_portfolio_draft()
             st.success("시트에 저장했습니다.")
             st.rerun()
 
@@ -2507,7 +2609,7 @@ with tab2:
         )
     if _mock_auto_price:
         st.caption(
-            "표에서 매수 정보를 수정할 때는 갱신 때문에 저장하지 않은 편집이 덮어씌워질 수 있으니, 수정 중에는 자동 갱신을 끄는 것을 권장합니다. "
+            "편집 중 미저장 행은 브라우저 세션에 잡아 두어 자동 갱신(fragment)에도 유지됩니다. 그래도 표가 이상하면 자동 갱신을 끄거나 **시트·시세 다시 불러오기**를 누르세요. "
             "가격 갱신은 이 탭의 포트폴리오 블록만 다시 그리므로, 1탭 분석 전체가 반복 실행되지는 않습니다(Streamlit 1.33+ 필요)."
         )
 
@@ -2524,6 +2626,7 @@ with tab2:
         ):
             _invalidate_mock_portfolio_sheet_cache()
             _invalidate_mock_price_caches()
+            _invalidate_mock_portfolio_draft()
             st.rerun()
 
     # 2~3글자만 입력하면 드롭다운으로 매칭 종목 표시 (ETF 등 긴 이름 입력 편의)
@@ -2581,6 +2684,7 @@ with tab2:
                     except RuntimeError as e:
                         st.error(str(e))
                     else:
+                        _invalidate_mock_portfolio_draft()
                         st.success(f"✅ {name}({code}) {qty}주 @ {price:,.2f}원 모의 매수 추가됨.")
                         st.rerun()
                 else:
