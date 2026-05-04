@@ -1423,6 +1423,93 @@ def _get_etf_codes() -> frozenset[str]:
     return frozenset(codes)
 
 
+@st.cache_data(ttl=3600)
+def _get_krx_code_to_name_map() -> dict[str, str]:
+    """종목코드(6자리) → 종목명 (주식+ETF). 모의 포트폴리오 편집 시 이름 자동 채움용."""
+    m: dict[str, str] = {}
+    for opt in _get_krx_stock_options():
+        parsed = _parse_stock_selection(opt)
+        if parsed:
+            c6, nm = parsed
+            m[str(c6).zfill(6)] = nm.strip()
+    return m
+
+
+def _lookup_ticker_name_by_code(code6: str) -> str:
+    """캐시된 KRX 목록 → pykrx 순으로 종목명 조회."""
+    c = str(code6).strip().zfill(6)
+    if len(c) != 6 or not c.isdigit():
+        return ""
+    nm = _get_krx_code_to_name_map().get(c, "").strip()
+    if nm:
+        return nm
+    if PYKRX_AVAILABLE:
+        try:
+            t = pykrx_stock.get_market_ticker_name(c)
+            if t and str(t).strip():
+                return str(t).strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _is_blank_cell(val) -> bool:
+    if val is None:
+        return True
+    if isinstance(val, str):
+        return val.strip() == ""
+    try:
+        if pd.isna(val):
+            return True
+    except Exception:
+        pass
+    return str(val).strip() == ""
+
+
+def _fill_missing_ticker_names(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """
+    종목코드는 있는데 종목명이 비어 있으면 KRX 목록/pykrx로 채움.
+    (ETF 표에 코드만 넣은 경우 저장 검증·시트 반영이 되도록)
+    """
+    if df is None or df.empty:
+        return df, False
+    if "종목코드" not in df.columns or "종목명" not in df.columns:
+        return df, False
+    d = df.copy()
+    changed = False
+    for idx in d.index:
+        if not _is_blank_cell(d.loc[idx, "종목명"]):
+            continue
+        raw = d.loc[idx, "종목코드"]
+        s = str(raw).strip().replace(".0", "") if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) else ""
+        if not s:
+            continue
+        nc = pd.to_numeric(s, errors="coerce")
+        if pd.isna(nc):
+            continue
+        c6 = str(int(nc)).zfill(6)
+        if len(c6) != 6 or not c6.isdigit():
+            continue
+        nm = _lookup_ticker_name_by_code(c6)
+        if nm:
+            d.loc[idx, "종목명"] = nm
+            changed = True
+    return d, changed
+
+
+_MOCK_STOCKS_EDITOR_PREFILL = "mock_stocks_editor_prefill_df"
+_MOCK_ETFS_EDITOR_PREFILL = "mock_etfs_editor_prefill_df"
+
+
+def _strip_data_editor_state(editor_key: str) -> None:
+    """prefill로 넘긴 데이터프레임이 표에 다시 그려지도록 위젯 상태 제거."""
+    try:
+        if editor_key in st.session_state:
+            del st.session_state[editor_key]
+    except Exception:
+        pass
+
+
 def _parse_stock_selection(selection: str) -> tuple[str, str] | None:
     """'종목명 (종목코드)' 형식에서 (코드, 종목명) 추출. 6자리 코드로 반환."""
     if not selection or not isinstance(selection, str):
@@ -1891,8 +1978,8 @@ def _render_mock_portfolio_inner() -> None:
     # 종목코드·종목명은 동적 행 추가(num_rows=dynamic) 시 비어 있으므로 반드시 편집 가능해야 함
     col_config = {
         "매수일자": st.column_config.TextColumn("매수일자", disabled=False, help="YYYY-MM-DD 형식으로 수정 가능"),
-        "종목코드": st.column_config.TextColumn("종목코드", disabled=False, help="6자리 숫자. 행 추가 시 필수"),
-        "종목명": st.column_config.TextColumn("종목명", disabled=False, help="행 추가 시 필수"),
+        "종목코드": st.column_config.TextColumn("종목코드", disabled=False, help="6자리 숫자. 입력 후 저장 전에 종목명이 비어 있으면 자동으로 채웁니다."),
+        "종목명": st.column_config.TextColumn("종목명", disabled=False, help="비어 있어도 됨 — 6자리 코드만 있으면 KRX 기준으로 자동 입력"),
         "매수단가": st.column_config.NumberColumn(
             "매수단가",
             format="%,.2f",
@@ -1937,23 +2024,39 @@ def _render_mock_portfolio_inner() -> None:
     edited_stocks = None
     edited_etfs = None
     if not pf_stocks.empty:
+        stocks_input = pf_stocks
+        if _MOCK_STOCKS_EDITOR_PREFILL in st.session_state:
+            _pv = st.session_state.pop(_MOCK_STOCKS_EDITOR_PREFILL)
+            if isinstance(_pv, pd.DataFrame) and not _pv.empty:
+                stocks_input = _pv
+                _strip_data_editor_state("mock_stocks_editor")
         st.subheader("📈 주식")
         edited_stocks = st.data_editor(
-            pf_stocks,
+            stocks_input,
             width="stretch",
-            height=min(300, 80 + len(pf_stocks) * 38),
+            height=min(300, 80 + len(stocks_input) * 38),
             hide_index=True,
             num_rows="dynamic",
             column_config=col_config,
             key="mock_stocks_editor",
         )
+        edited_stocks, _stock_names_filled = _fill_missing_ticker_names(edited_stocks)
+        if _stock_names_filled:
+            st.session_state[_MOCK_STOCKS_EDITOR_PREFILL] = edited_stocks
+            st.rerun()
 
     st.subheader("📊 ETF")
     # 빈 표를 columns=만으로 만들면 매수단가가 object/int로 잡혀 data_editor가 소수 입력을 막는 경우가 있음(모바일 특히)
     etf_editor_df = pf_etfs.copy() if not pf_etfs.empty else pf.iloc[0:0].copy()
-    _n_etf = len(etf_editor_df)
+    etf_input = etf_editor_df
+    if _MOCK_ETFS_EDITOR_PREFILL in st.session_state:
+        _ev = st.session_state.pop(_MOCK_ETFS_EDITOR_PREFILL)
+        if isinstance(_ev, pd.DataFrame) and not _ev.empty:
+            etf_input = _ev
+            _strip_data_editor_state("mock_etfs_editor")
+    _n_etf = len(etf_input)
     edited_etfs = st.data_editor(
-        etf_editor_df,
+        etf_input,
         width="stretch",
         height=min(420, 80 + max(_n_etf, 1) * 38),
         hide_index=True,
@@ -1961,7 +2064,11 @@ def _render_mock_portfolio_inner() -> None:
         column_config=col_config,
         key="mock_etfs_editor",
     )
-    st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 코드·종목명·일자·단가·수량을 입력하세요.")
+    edited_etfs, _etf_names_filled = _fill_missing_ticker_names(edited_etfs)
+    if _etf_names_filled:
+        st.session_state[_MOCK_ETFS_EDITOR_PREFILL] = edited_etfs
+        st.rerun()
+    st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 **종목코드**(6자리)만 넣어도 종목명이 자동 입력됩니다. 일자·단가·수량을 입력하세요.")
     _etf_for_summary = edited_etfs if edited_etfs is not None and not edited_etfs.empty else pf_etfs
     if _etf_for_summary is not None and not _etf_for_summary.empty:
         _sum_df = _etf_for_summary.copy()
