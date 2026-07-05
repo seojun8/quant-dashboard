@@ -1370,6 +1370,49 @@ def _pykrx_lookup_ticker_name(code6: str) -> str:
     return ""
 
 
+def _is_mojibake_ticker_name(name: str) -> bool:
+    """UTF-8 페이지를 EUC-KR로 잘못 읽을 때 생기는 종목명 깨짐(예: 誘멸뎅…) 감지."""
+    s = str(name or "").strip()
+    if not s or "\ufffd" in s:
+        return bool(s and "\ufffd" in s)
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", s))
+    has_hangul = bool(re.search(r"[\uac00-\ud7a3]", s))
+    if has_cjk and has_hangul:
+        return True
+    if has_cjk and re.match(
+        r"^(TIGER|KODEX|ACE|RISE|SOL|PLUS|HANARO|KOACT|KBSTAR|ARIRANG|TIME|WOORI|마이티|TREX)",
+        s,
+        re.I,
+    ):
+        return True
+    return False
+
+
+def _parse_naver_ticker_name_from_html(content: bytes) -> str:
+    """네이버 금융 HTML에서 종목명 추출 (UTF-8·EUC-KR 페이지 모두 대응)."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for enc in ("utf-8", "euc-kr", "cp949"):
+        try:
+            text = content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        soup = BeautifulSoup(text, "html.parser")
+        for sel in (".wrap_company h2 a", ".wrap_company h2"):
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            nm = el.get_text(strip=True)
+            if nm and nm not in seen:
+                candidates.append(nm)
+                seen.add(nm)
+            break
+    good = [c for c in candidates if not _is_mojibake_ticker_name(c)]
+    if good:
+        return good[0]
+    return candidates[0] if candidates else ""
+
+
 @st.cache_data(ttl=86400)
 def _naver_ticker_name(code6: str) -> str:
     """네이버 금융 종목 페이지에서 종목명 조회 (FDR·pykrx 실패 시 폴백)."""
@@ -1379,14 +1422,7 @@ def _naver_ticker_name(code6: str) -> str:
     try:
         url = f"https://finance.naver.com/item/main.naver?code={c}"
         r = _requests_session.get(url, timeout=10)
-        r.encoding = "euc-kr"
-        soup = BeautifulSoup(r.text, "html.parser")
-        for sel in (".wrap_company h2 a", ".wrap_company h2"):
-            el = soup.select_one(sel)
-            if el:
-                nm = el.get_text(strip=True)
-                if nm:
-                    return nm
+        return _parse_naver_ticker_name_from_html(r.content)
     except Exception:
         pass
     return ""
@@ -1553,7 +1589,8 @@ def _fill_missing_ticker_names(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     d = df.copy()
     changed = False
     for idx in d.index:
-        if not _is_blank_cell(d.loc[idx, "종목명"]):
+        existing = "" if _is_blank_cell(d.loc[idx, "종목명"]) else str(d.loc[idx, "종목명"]).strip()
+        if existing and not _is_mojibake_ticker_name(existing):
             continue
         raw = d.loc[idx, "종목코드"]
         s = str(raw).strip().replace(".0", "") if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) else ""
@@ -1566,7 +1603,7 @@ def _fill_missing_ticker_names(df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
         if len(c6) != 6 or not c6.isdigit():
             continue
         nm = _lookup_ticker_name_by_code(c6)
-        if nm:
+        if nm and (not existing or nm != existing):
             d.loc[idx, "종목명"] = nm
             changed = True
     return d, changed
