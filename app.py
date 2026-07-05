@@ -1611,6 +1611,26 @@ def _strip_data_editor_state(editor_key: str) -> None:
         pass
 
 
+def _format_mock_pf_row_label(row: pd.Series, row_no: int) -> str:
+    """모의 포트폴리오 행 삭제 선택 목록용 라벨."""
+    raw_code = row.get("종목코드", "")
+    if raw_code is None or (isinstance(raw_code, float) and pd.isna(raw_code)):
+        code = ""
+    else:
+        code = str(raw_code).strip().replace(".0", "")
+        nc = pd.to_numeric(code, errors="coerce")
+        if pd.notna(nc):
+            code = str(int(nc)).zfill(6)
+    name = str(row.get("종목명", "") or "").strip() or "(종목명 없음)"
+    date = str(row.get("매수일자", "") or "").strip() or "(일자 없음)"
+    price = pd.to_numeric(row.get("매수단가", 0), errors="coerce")
+    qty = pd.to_numeric(row.get("매수수량", 0), errors="coerce")
+    price_f = float(price) if pd.notna(price) else 0.0
+    qty_f = float(qty) if pd.notna(qty) else 0.0
+    code_part = f"{code} " if code else ""
+    return f"#{row_no} · {date} · {code_part}{name} · {price_f:,.2f}원 × {qty_f:g}주"
+
+
 def _parse_stock_selection(selection: str) -> tuple[str, str] | None:
     """'종목명 (종목코드)' 형식에서 (코드, 종목명) 추출. 6자리 코드로 반환."""
     if not selection or not isinstance(selection, str):
@@ -2232,6 +2252,49 @@ def _render_mock_portfolio_inner() -> None:
         st.session_state[_MOCK_ETFS_EDITOR_PREFILL] = edited_etfs
         st.rerun()
 
+    _etf_for_delete = edited_etfs if edited_etfs is not None else etf_input
+    if _etf_for_delete is not None and not _etf_for_delete.empty:
+        _etf_rows_view = _etf_for_delete.reset_index(drop=True)
+        _etf_row_choices: list[tuple[str, int]] = []
+        for _row_idx, _row in _etf_rows_view.iterrows():
+            _etf_row_choices.append((_format_mock_pf_row_label(_row, len(_etf_row_choices) + 1), int(_row_idx)))
+        with st.expander("🗑️ ETF 행 삭제", expanded=False):
+            st.caption("잘못 입력한 매수 건을 표에서 지웁니다. **Google 시트 반영**은 아래 **저장** 버튼을 눌러야 합니다.")
+            _del_labels = [label for label, _ in _etf_row_choices]
+            _del_pick = st.multiselect(
+                "삭제할 매수 건",
+                options=_del_labels,
+                key="mock_etf_delete_pick",
+                placeholder="삭제할 행을 선택하세요",
+            )
+            if st.button(
+                "선택 행 삭제",
+                key="mock_etf_delete_btn",
+                type="secondary",
+                disabled=not _del_pick,
+            ):
+                _drop_idx = {idx for label, idx in _etf_row_choices if label in _del_pick}
+                _new_etf = _etf_rows_view.drop(index=list(_drop_idx)).reset_index(drop=True)
+                if _new_etf.empty:
+                    _new_etf = pf.iloc[0:0].copy()
+                elif all(c in _new_etf.columns for c in save_cols):
+                    _new_etf = _rebuild_mock_editor_df(_new_etf, save_cols)
+                _draft_after_del: list[pd.DataFrame] = []
+                if edited_stocks is not None and not edited_stocks.empty and all(c in edited_stocks.columns for c in save_cols):
+                    _draft_after_del.append(edited_stocks[save_cols].copy())
+                if not _new_etf.empty and all(c in _new_etf.columns for c in save_cols):
+                    _draft_after_del.append(_new_etf[save_cols].copy())
+                if _draft_after_del:
+                    st.session_state[_MOCK_PORTFOLIO_DRAFT_RAW_KEY] = _coerce_mock_sheet_numeric_columns(
+                        pd.concat(_draft_after_del, ignore_index=True)
+                    )
+                elif edited_stocks is None or edited_stocks.empty:
+                    _invalidate_mock_portfolio_draft()
+                st.session_state[_MOCK_ETFS_EDITOR_PREFILL] = _new_etf
+                _strip_data_editor_state("mock_etfs_editor")
+                st.session_state.pop("mock_etf_delete_pick", None)
+                st.rerun()
+
     _draft_parts: list[pd.DataFrame] = []
     if edited_stocks is not None and not edited_stocks.empty and all(c in edited_stocks.columns for c in save_cols):
         _draft_parts.append(edited_stocks[save_cols].copy())
@@ -2244,7 +2307,10 @@ def _render_mock_portfolio_inner() -> None:
     else:
         _invalidate_mock_portfolio_draft()
 
-    st.caption("**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 **종목코드**(6자리)만 넣어도 종목명이 자동 입력됩니다. 일자·단가·수량을 입력하세요.")
+    st.caption(
+        "**종목별 종합 수익률** (동일 ETF 분할매수 건 통합) · 행 하단 **+** 로 ETF 매수 건을 추가한 뒤 **종목코드**(6자리)만 넣어도 종목명이 자동 입력됩니다. "
+        "잘못 입력한 건은 위 **🗑️ ETF 행 삭제**에서 지운 뒤 **Google 시트에 저장**하세요."
+    )
     _etf_for_summary = edited_etfs if edited_etfs is not None and not edited_etfs.empty else pf_etfs
     if _etf_for_summary is not None and not _etf_for_summary.empty:
         _sum_df = _etf_for_summary.copy()
