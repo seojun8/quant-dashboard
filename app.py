@@ -302,6 +302,16 @@ def _invalidate_mock_price_caches() -> None:
         _fetch_close_series_range.clear()
     except Exception:
         pass
+    for fn in (
+        _get_krx_stock_options,
+        _get_krx_code_to_name_map,
+        _get_etf_codes,
+        _naver_ticker_name,
+    ):
+        try:
+            fn.clear()
+        except Exception:
+            pass
 
 
 # ============== 날짜 유틸 ==============
@@ -1309,6 +1319,79 @@ def _fallback_tickers(
     })
 
 
+def _coerce_pykrx_ticker_name(val) -> str:
+    """pykrx 종목명 조회 반환값(str·DataFrame·Series 등)을 안전하게 문자열로."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, pd.DataFrame):
+        if val.empty:
+            return ""
+        for col in val.columns:
+            if len(val) == 0:
+                break
+            cell = val[col].iloc[0]
+            if cell is not None and not (isinstance(cell, float) and pd.isna(cell)):
+                s = str(cell).strip()
+                if s:
+                    return s
+        return ""
+    if isinstance(val, pd.Series):
+        if val.empty:
+            return ""
+        cell = val.iloc[0]
+        if cell is not None and not (isinstance(cell, float) and pd.isna(cell)):
+            return str(cell).strip()
+        return ""
+    s = str(val).strip()
+    if s.startswith("Empty DataFrame"):
+        return ""
+    return s
+
+
+def _pykrx_lookup_ticker_name(code6: str) -> str:
+    """pykrx ETF·주식 API 순으로 종목명 조회 (ETF는 get_market_ticker_name이 빈 DataFrame을 반환하는 경우가 있음)."""
+    if not PYKRX_AVAILABLE:
+        return ""
+    c = str(code6).strip().zfill(6)
+    if len(c) != 6 or not c.isdigit():
+        return ""
+    for fn_name in ("get_etf_ticker_name", "get_market_ticker_name"):
+        fn = getattr(pykrx_stock, fn_name, None)
+        if not callable(fn):
+            continue
+        try:
+            nm = _coerce_pykrx_ticker_name(fn(c))
+            if nm:
+                return nm
+        except Exception:
+            continue
+    return ""
+
+
+@st.cache_data(ttl=86400)
+def _naver_ticker_name(code6: str) -> str:
+    """네이버 금융 종목 페이지에서 종목명 조회 (FDR·pykrx 실패 시 폴백)."""
+    c = str(code6).strip().zfill(6)
+    if len(c) != 6 or not c.isdigit():
+        return ""
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={c}"
+        r = _requests_session.get(url, timeout=10)
+        r.encoding = "euc-kr"
+        soup = BeautifulSoup(r.text, "html.parser")
+        for sel in (".wrap_company h2 a", ".wrap_company h2"):
+            el = soup.select_one(sel)
+            if el:
+                nm = el.get_text(strip=True)
+                if nm:
+                    return nm
+    except Exception:
+        pass
+    return ""
+
+
 def _pykrx_etf_ticker_names(end_date: str) -> list[tuple[str, str]]:
     """pykrx ETF 코드·이름 (FinanceDataReader ETF/KR 실패 시 보조)."""
     if not PYKRX_AVAILABLE:
@@ -1335,11 +1418,7 @@ def _pykrx_etf_ticker_names(end_date: str) -> list[tuple[str, str]]:
                 t6 = str(t).strip().zfill(6)
                 if not (len(t6) == 6 and t6.isdigit()):
                     continue
-                try:
-                    nm = pykrx_stock.get_market_ticker_name(t)
-                except Exception:
-                    nm = ""
-                nm = str(nm).strip()
+                nm = _pykrx_lookup_ticker_name(t6)
                 if nm:
                     out.append((t6, nm))
             return out
@@ -1436,21 +1515,17 @@ def _get_krx_code_to_name_map() -> dict[str, str]:
 
 
 def _lookup_ticker_name_by_code(code6: str) -> str:
-    """캐시된 KRX 목록 → pykrx 순으로 종목명 조회."""
+    """캐시된 KRX 목록 → pykrx → 네이버 금융 순으로 종목명 조회."""
     c = str(code6).strip().zfill(6)
     if len(c) != 6 or not c.isdigit():
         return ""
     nm = _get_krx_code_to_name_map().get(c, "").strip()
     if nm:
         return nm
-    if PYKRX_AVAILABLE:
-        try:
-            t = pykrx_stock.get_market_ticker_name(c)
-            if t and str(t).strip():
-                return str(t).strip()
-        except Exception:
-            pass
-    return ""
+    nm = _pykrx_lookup_ticker_name(c)
+    if nm:
+        return nm
+    return _naver_ticker_name(c)
 
 
 def _is_blank_cell(val) -> bool:
